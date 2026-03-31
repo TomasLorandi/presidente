@@ -334,7 +334,7 @@
     <h1>PRESIDENTE</h1>
     <div id="status-msg">Iniciando...</div>
     <div style="min-width:80px;display:flex;justify-content:flex-end;align-items:center;gap:8px">
-      <button id="btn-online" onclick="openLobby()" title="Multijugador Online" style="background:none;border:none;color:var(--gold);font-size:1.1rem;cursor:pointer;opacity:.7;transition:opacity .2s;padding:4px 8px;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.7">🌐</button>
+      <button onclick="openLobby()" title="Multijugador Online" style="background:none;border:none;color:var(--gold);font-size:1.1rem;cursor:pointer;opacity:.7;transition:opacity .2s;padding:4px 8px;" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.7">🌐</button>
       <button id="btn-settings" onclick="openSettings()" title="Personalización">⚙️</button>
     </div>
   </div>
@@ -872,10 +872,15 @@ function toggleExchangeSelect(idx){
 }
 
 function confirmExchange(){
+  if(NET.online && !NET.isHost){
+    if(!exchangePending) return;
+    NET.sendAction({type:'EXCHANGE',indices:[...exchangePending.selected]});
+    document.getElementById('modal-exchange').classList.remove('show');
+    exchangePending=null; return;
+  }
   if(!exchangePending) return;
   const {giver,receiver,selected}=exchangePending;
   const toGive=selected.map(i=>giver.mano[i]);
-  // Remove in reverse order to preserve indices
   selected.slice().sort((a,b)=>b-a).forEach(i=>giver.mano.splice(i,1));
   toGive.forEach(c=>receiver.mano.push(c));
   giver.sortHand(); receiver.sortHand();
@@ -887,7 +892,10 @@ function confirmExchange(){
 // ══════════════════════════════════════════════════════════
 //  RENDER
 // ══════════════════════════════════════════════════════════
-function renderAll(){ renderBots(); renderPlayerHand(); renderTable(); renderBelowTable(); updateControls(); }
+function renderAll(){
+  renderBots(); renderPlayerHand(); renderTable(); renderBelowTable(); updateControls();
+  if(NET.online && NET.isHost) NET.broadcast();
+}
 
 function renderBelowTable(){
   const rtEl=document.getElementById('info-ronda-tipo');
@@ -1055,41 +1063,51 @@ function toggleSelect(idx){
 // ══════════════════════════════════════════════════════════
 function playSelected(){
   if(selected.length===0) return;
+  // ONLINE GUEST: send action to host
+  if(NET.online && !NET.isHost){
+    if(NET.myIdx!==turnoIdx) return;
+    const j=jugadores[NET.myIdx];
+    const cartas=selected.map(i=>j.mano[i]);
+    const hasJoker=cartas.some(c=>c.esComodin);
+    if(hasJoker){
+      const normales=cartas.filter(c=>!c.esComodin);
+      if(normales.length>0){
+        const valBase=normales[0].value;
+        const mesaOrd=mesaCartas.length>0?mesaCartas[0].effOrder():-1;
+        if(VORDER[valBase]>mesaOrd||mesaCartas.length===0){
+          NET.sendAction({type:'PLAY',indices:[...selected],jokerVal:valBase});
+          selected=[]; return;
+        }
+      }
+      NET.pendingIdx=[...selected];
+      openJokerForNet(cartas); return;
+    }
+    NET.sendAction({type:'PLAY',indices:[...selected]});
+    selected=[]; return;
+  }
+  // LOCAL / HOST path
   const j=jugadores[0];
   const cartas=selected.map(i=>j.mano[i]);
-
   if(primeraRonda&&mesaCartas.length===0){
     if(!cartas.some(c=>c.value==='2'&&c.suit==='♦')){ toast('Debés jugar el 2♦ para arrancar'); return; }
   }
-
   const tieneComodin=cartas.some(c=>c.esComodin);
-
   if(tieneComodin){
     if(mesaCartas.length>0&&cartas.length!==mesaCantidad){ toast(`Debés jugar exactamente ${mesaCantidad} carta${mesaCantidad>1?'s':''}`); return; }
     const normales=cartas.filter(c=>!c.esComodin);
     if(normales.length>1&&normales.some(c=>c.value!==normales[0].value)){ toast('Las cartas normales deben ser del mismo valor'); return; }
-
-    // K: if joker accompanies normal cards, auto-assign the same value
     if(normales.length>0){
       const valBase=normales[0].value;
-      // Check if this value beats the table
       const mesaOrd=mesaCartas.length>0?mesaCartas[0].effOrder():-1;
       if(VORDER[valBase]>mesaOrd||mesaCartas.length===0){
-        // Auto-assign joker to base value
         cartas.filter(c=>c.esComodin).forEach(c=>{c.jokerVal=valBase;});
         if(!validatePlay(cartas)) return;
         doPlay(j,cartas);
-      } else {
-        // Base value doesn't beat table; let user pick a higher value for joker
-        openJoker(cartas,j,valBase);
-      }
+      } else { openJoker(cartas,j,valBase); }
       return;
     }
-    // Only jokers — let user pick
-    openJoker(cartas,j,null);
-    return;
+    openJoker(cartas,j,null); return;
   }
-
   if(!validatePlay(cartas)) return;
   doPlay(j,cartas);
 }
@@ -1167,6 +1185,10 @@ function doPlay(jugador,cartas){
 }
 
 function passTurn(){
+  if(NET.online && !NET.isHost){
+    if(NET.myIdx!==turnoIdx) return;
+    NET.sendAction({type:'PASS'}); selected=[]; return;
+  }
   const j=jugadores[0]; j.pasado=true; selected=[]; turnoIdx=nextActive(j.id);
   setStatus('Pasaste'); advanceTurn();
 }
@@ -1471,559 +1493,356 @@ function openSettings(){
 function closeSettings(){ document.getElementById('modal-settings').classList.remove('show'); }
 
 // ══════════════════════════════════════════════════════════
-//  MULTIPLAYER ONLINE (PeerJS)
+//  MULTIPLAYER — NET object
 // ══════════════════════════════════════════════════════════
+const NET = {
+  online: false,
+  isHost: false,
+  myIdx: 0,
+  peer: null,
+  hostConn: null,       // guest → host
+  guests: {},           // host → {peerId: {conn, idx, name}}
+  roomCode: null,
+  pendingIdx: [],       // for joker selection on guest
 
-let onlineMode    = false;  // true when playing online
-let isHost        = false;  // true = this client runs the game engine
-let myPeerId      = null;   // our PeerJS ID
-let myPlayerIdx   = null;   // which jugador[] index we are (0=host)
-let peer          = null;   // PeerJS instance
-let hostConn      = null;   // guest→host connection
-let guestConns    = {};     // host's connections to each guest {peerId: conn}
-let onlineNames   = {};     // player index → display name
-let roomCode      = null;   // 4-letter room code
-let expectedPlayers = 4;    // how many players will join
+  sendAction(action){
+    if(this.hostConn && this.hostConn.open)
+      this.hostConn.send({type:'ACTION', action});
+  },
 
-// ── LOBBY UI ──────────────────────────────────────────────
-function openLobby(){
-  const c = document.getElementById('lobby-content');
-  c.innerHTML = `
-    <div class="modal-sub" style="margin-bottom:20px">Jugá con amigos en cualquier red</div>
-    <div style="display:flex;flex-direction:column;gap:12px;">
-      <button class="btn primary" onclick="startHostFlow()" style="width:100%;padding:14px">
-        🏠 Crear partida (Host)
-      </button>
-      <button class="btn" onclick="startGuestFlow()" style="width:100%;padding:14px">
-        🎮 Unirse a partida
-      </button>
-      <button class="btn" onclick="closeLobby()" style="width:100%;font-size:.65rem;opacity:.6;padding:8px">
-        Cancelar
-      </button>
-    </div>`;
-  document.getElementById('modal-lobby').classList.add('show');
-}
-function closeLobby(){ document.getElementById('modal-lobby').classList.remove('show'); }
+  broadcast(){
+    const state = this.serialize();
+    Object.values(this.guests).forEach(g => {
+      try{ g.conn.send({type:'STATE', state, forIdx: g.idx}); }catch(e){}
+    });
+  },
 
-// ── HOST FLOW ─────────────────────────────────────────────
-function startHostFlow(){
-  closeLobby();
-  showWaiting('Creando sala...', 'Conectando con el servidor...');
-  document.getElementById('wait-btns').innerHTML = '';
+  serialize(){
+    return {
+      jugadores: jugadores.map(j=>({
+        id:j.id, nombre:j.nombre, pasado:j.pasado,
+        terminado:j.terminado, posicion:j.posicion, rolPrev:j.rolPrev,
+        mano: j.mano.map(c=>({value:c.value,suit:c.suit,jokerVal:c.jokerVal}))
+      })),
+      mesaCartas: mesaCartas.map(c=>({value:c.value,suit:c.suit,jokerVal:c.jokerVal})),
+      mesaCantidad, turnoIdx, ultimoEnJugar, numRonda,
+      finishOrder: finishOrder.map(j=>j.id),
+      gameOver, primeraRonda,
+      exchangePending: exchangePending ? {
+        giverIdx: exchangePending.giver.id,
+        receiverIdx: exchangePending.receiver.id,
+        count: exchangePending.count
+      } : null,
+      statusMsg: document.getElementById('status-msg').textContent,
+      aboveMsg: document.getElementById('above-table-msg').textContent
+    };
+  },
 
-  // Generate a short room code (4 uppercase letters)
-  roomCode = Math.random().toString(36).substring(2,6).toUpperCase();
-  const peerId = 'PRES-' + roomCode;
-  myPlayerIdx = 0;
-  isHost = true;
-  onlineNames = { 0: nombres[0] };
-
-  peer = new Peer(peerId, { debug: 0 });
-
-  peer.on('open', id => {
-    myPeerId = id;
-    showWaiting(`Sala creada: <span style="color:var(--gold);font-size:1.4rem;letter-spacing:6px">${roomCode}</span>`,
-      'Compartí este código con los otros jugadores');
-    renderWaitPlayers();
-    const btns = document.getElementById('wait-btns');
-    btns.innerHTML = `
-      <button class="btn" onclick="cancelOnline()">Cancelar</button>`;
-    // Start button appears once ≥2 players connected
-    updateStartButton();
-  });
-
-  peer.on('connection', conn => {
-    conn.on('open', () => {
-      guestConns[conn.peer] = conn;
-      // Assign player index
-      const idx = Object.keys(guestConns).length; // 1, 2, 3, 4
-      conn.metadata = conn.metadata || {};
-      conn.metadata.playerIdx = idx;
-      conn.metadata.name = `Bot ${idx}`; // will update when guest sends name
-
-      conn.on('data', data => handleHostReceive(conn, data));
-      conn.on('close', () => {
-        delete guestConns[conn.peer];
-        renderWaitPlayers();
-        updateStartButton();
+  applyState(state, myIdx){
+    // Rebuild jugadores
+    if(jugadores.length !== state.jugadores.length){
+      jugadores = state.jugadores.map(jd=>{
+        const j=new Jugador(jd.id, jd.nombre, jd.id===myIdx);
+        j.pasado=jd.pasado; j.terminado=jd.terminado;
+        j.posicion=jd.posicion; j.rolPrev=jd.rolPrev;
+        j.mano=jd.mano.map(cd=>{ const c=new Carta(cd.value,cd.suit); c.jokerVal=cd.jokerVal; return c; });
+        return j;
       });
-
-      // Send them their player index and current room state
-      conn.send({ type:'ASSIGN', idx, roomCode, numJugadores:expectedPlayers });
-      renderWaitPlayers();
-      updateStartButton();
-    });
-  });
-
-  peer.on('error', err => {
-    showWaiting('Error de conexión', err.message || String(err));
-  });
-}
-
-function updateStartButton(){
-  const total = 1 + Object.keys(guestConns).length;
-  const btns = document.getElementById('wait-btns');
-  const existing = btns.querySelector('#btn-start-online');
-  if(total >= 2){
-    if(!existing){
-      const b = document.createElement('button');
-      b.id = 'btn-start-online'; b.className = 'btn primary';
-      b.textContent = `Comenzar (${total} jugadores)`;
-      b.onclick = hostStartGame;
-      btns.insertBefore(b, btns.firstChild);
     } else {
-      existing.textContent = `Comenzar (${total} jugadores)`;
+      state.jugadores.forEach((jd,i)=>{
+        const j=jugadores[i];
+        j.nombre=jd.nombre; j.pasado=jd.pasado;
+        j.terminado=jd.terminado; j.posicion=jd.posicion; j.rolPrev=jd.rolPrev;
+        // Only update my own hand from state
+        if(i===myIdx){
+          j.mano=jd.mano.map(cd=>{ const c=new Carta(cd.value,cd.suit); c.jokerVal=cd.jokerVal; return c; });
+        }
+      });
     }
-  } else {
-    if(existing) existing.remove();
-  }
-}
 
-function hostStartGame(){
-  const total = 1 + Object.keys(guestConns).length;
-  expectedPlayers = total;
-  numJugadores = total;
-
-  // Assign final indices and collect names
-  const guestList = Object.values(guestConns);
-  guestList.forEach((conn, i) => {
-    conn.metadata.playerIdx = i + 1;
-    onlineNames[i+1] = conn.metadata.name || nombres[i+1] || `Jugador ${i+2}`;
-    nombres[i+1] = onlineNames[i+1];
-  });
-
-  // Tell each guest their final index and that game is starting
-  guestList.forEach(conn => {
-    conn.send({ type:'START', playerIdx: conn.metadata.playerIdx, numJugadores: total, names: onlineNames });
-  });
-
-  document.getElementById('modal-waiting').classList.remove('show');
-  onlineMode = true;
-  document.getElementById('online-bar').style.display = 'block';
-  rolesAnteriores = {}; dealStartId = -1;
-  startGame();
-}
-
-function handleHostReceive(conn, data){
-  if(!onlineMode) return;
-  const from = conn.metadata.playerIdx;
-  if(data.type === 'NAME'){
-    conn.metadata.name = data.name;
-    onlineNames[from] = data.name;
-    nombres[from] = data.name;
-    renderWaitPlayers();
-  }
-  if(data.type === 'ACTION'){
-    // Guest is doing an action — execute it on the host's game engine
-    applyGuestAction(from, data.action);
-  }
-}
-
-// Apply an action from a guest as if that player did it locally
-function applyGuestAction(playerIdx, action){
-  // Temporarily make turnoIdx match this guest
-  if(turnoIdx !== playerIdx) return; // not their turn
-  if(action.type === 'PLAY'){
-    // action.indices = array of card indices in jugadores[playerIdx].mano
-    const j = jugadores[playerIdx];
-    const cartas = action.indices.map(i => j.mano[i]);
-    const hasJoker = cartas.some(c => c.esComodin);
-    if(hasJoker && action.jokerVal){
-      cartas.filter(c => c.esComodin).forEach(c => { c.jokerVal = action.jokerVal; });
-    }
-    doPlay(j, cartas);
-  }
-  if(action.type === 'PASS'){
-    const j = jugadores[playerIdx];
-    j.pasado = true; selected = [];
-    turnoIdx = nextActive(j.id);
-    setStatus(`${j.nombre} pasó`);
-    advanceTurn();
-  }
-  if(action.type === 'EXCHANGE'){
-    if(exchangePending && exchangePending.giver.id === playerIdx){
-      const {giver, receiver} = exchangePending;
-      const toGive = action.indices.map(i => giver.mano[i]);
-      action.indices.slice().sort((a,b)=>b-a).forEach(i => giver.mano.splice(i,1));
-      toGive.forEach(c => receiver.mano.push(c));
-      giver.sortHand(); receiver.sortHand();
-      exchangePending = null;
-      document.getElementById('modal-exchange').classList.remove('show');
-      setTimeout(processExchangeQueue, 400);
-    }
-  }
-}
-
-// Broadcast full game state to all guests after every state change
-function broadcastState(){
-  if(!onlineMode || !isHost) return;
-  const state = serializeState();
-  Object.values(guestConns).forEach(conn => {
-    try{ conn.send({ type:'STATE', state }); } catch(e){}
-  });
-}
-
-function serializeState(){
-  return {
-    jugadores: jugadores.map(j => ({
-      id:j.id, nombre:j.nombre, pasado:j.pasado,
-      terminado:j.terminado, posicion:j.posicion, rolPrev:j.rolPrev,
-      manoCount:j.mano.length,
-      // Only send full hand to the respective player — everyone else gets counts
-      mano: j.mano.map(c => ({value:c.value, suit:c.suit, jokerVal:c.jokerVal}))
-    })),
-    mesaCartas: mesaCartas.map(c => ({value:c.value, suit:c.suit, jokerVal:c.jokerVal})),
-    mesaCantidad, turnoIdx, ultimoEnJugar, numRonda, mesaCantidad,
-    finishOrder: finishOrder.map(j=>j.id),
-    gameOver, primeraRonda, mesaCantidad,
-    exchangePending: exchangePending ? {
-      giverIdx: exchangePending.giver.id,
-      receiverIdx: exchangePending.receiver.id,
-      count: exchangePending.count
-    } : null,
-    statusMsg: document.getElementById('status-msg').textContent
-  };
-}
-
-// ── GUEST FLOW ────────────────────────────────────────────
-function startGuestFlow(){
-  closeLobby();
-  const c = document.getElementById('lobby-content');
-  // Show input for room code
-  document.getElementById('modal-lobby').classList.add('show');
-  c.innerHTML = `
-    <div class="modal-sub" style="margin-bottom:16px">Ingresá el código de sala</div>
-    <input id="room-code-input" maxlength="4" placeholder="XXXX"
-      style="font-family:'Cinzel',serif;font-size:1.6rem;letter-spacing:8px;
-             text-align:center;text-transform:uppercase;width:100%;padding:12px;
-             background:rgba(255,255,255,.06);border:1px solid var(--gold);
-             color:var(--gold);border-radius:6px;outline:none;margin-bottom:16px;">
-    <div style="display:flex;flex-direction:column;gap:8px;">
-      <button class="btn primary" onclick="connectToHost()" style="width:100%;padding:12px">
-        Conectar
-      </button>
-      <button class="btn" onclick="closeLobby()" style="width:100%;font-size:.65rem;opacity:.6;padding:8px">
-        Cancelar
-      </button>
-    </div>`;
-  setTimeout(() => {
-    const inp = document.getElementById('room-code-input');
-    if(inp){ inp.focus();
-      inp.onkeydown = e => { if(e.key==='Enter') connectToHost(); };
-    }
-  }, 100);
-}
-
-function connectToHost(){
-  const inp = document.getElementById('room-code-input');
-  if(!inp) return;
-  const code = inp.value.trim().toUpperCase();
-  if(code.length !== 4){ toast('El código debe tener 4 letras'); return; }
-  closeLobby();
-  showWaiting('Conectando...', `Buscando sala ${code}...`);
-
-  roomCode = code;
-  isHost = false;
-  const myName = nombres[0];
-
-  peer = new Peer({ debug: 0 });
-  peer.on('open', id => {
-    myPeerId = id;
-    hostConn = peer.connect('PRES-' + code, { reliable: true });
-
-    hostConn.on('open', () => {
-      hostConn.send({ type:'NAME', name: myName });
-      showWaiting('Conectado ✓', 'Esperando que el host inicie la partida...');
-      document.getElementById('wait-btns').innerHTML =
-        `<button class="btn" onclick="cancelOnline()">Salir</button>`;
+    mesaCartas=(state.mesaCartas||[]).map(cd=>{
+      const c=new Carta(cd.value,cd.suit); c.jokerVal=cd.jokerVal; return c;
     });
+    mesaCantidad  = state.mesaCantidad||0;
+    turnoIdx      = state.turnoIdx;
+    ultimoEnJugar = state.ultimoEnJugar;
+    numRonda      = state.numRonda||0;
+    gameOver      = state.gameOver||false;
+    primeraRonda  = state.primeraRonda!==undefined ? state.primeraRonda : true;
 
-    hostConn.on('data', data => handleGuestReceive(data));
+    if(state.statusMsg) setStatus(state.statusMsg);
+    if(state.aboveMsg)  showAboveMsg(state.aboveMsg);
 
-    hostConn.on('close', () => {
-      if(onlineMode){
-        toast('Conexión perdida con el host');
-        cancelOnline();
+    // Exchange for this guest
+    if(state.exchangePending && state.exchangePending.giverIdx===myIdx){
+      const ep=state.exchangePending;
+      if(!exchangePending){
+        exchangePending={
+          giver:jugadores[ep.giverIdx], receiver:jugadores[ep.receiverIdx],
+          count:ep.count, selected:[]
+        };
+        openExchangeModal(exchangePending.giver, exchangePending.receiver, ep.count);
       }
-    });
-  });
-
-  peer.on('error', err => {
-    showWaiting('No se encontró la sala', `Verificá el código e intentá de nuevo`);
-    document.getElementById('wait-btns').innerHTML =
-      `<button class="btn primary" onclick="startGuestFlow()">Reintentar</button>
-       <button class="btn" onclick="cancelOnline()">Cancelar</button>`;
-  });
-}
-
-function handleGuestReceive(data){
-  if(data.type === 'ASSIGN'){
-    myPlayerIdx = data.idx;
-    showWaiting(`Unido a la sala ${data.roomCode}`,
-      `Sos el Jugador ${data.idx + 1} — esperando jugadores...`);
-  }
-  if(data.type === 'START'){
-    myPlayerIdx = data.playerIdx;
-    numJugadores = data.numJugadores;
-    Object.assign(nombres, data.names || {});
-    document.getElementById('modal-waiting').classList.remove('show');
-    onlineMode = true;
-    document.getElementById('online-bar').style.display = 'block';
-    rolesAnteriores = {}; dealStartId = -1;
-    // Guest doesn't run game engine — wait for first STATE
-    setStatus('Esperando la partida...');
-  }
-  if(data.type === 'STATE'){
-    applyStateFromHost(data.state);
-  }
-  if(data.type === 'ASK_JOKER'){
-    // Host asks guest to choose joker value
-    openJokerForGuest(data.options, data.cardsInPlay);
-  }
-  if(data.type === 'ASK_EXCHANGE'){
-    // Host asks guest to choose exchange cards
-    openExchangeForGuest(data.giverIdx, data.receiverIdx, data.count);
-  }
-}
-
-function applyStateFromHost(state){
-  // Rebuild jugadores from state
-  if(!jugadores.length || jugadores.length !== state.jugadores.length){
-    jugadores = state.jugadores.map(jd => {
-      const j = new Jugador(jd.id, jd.nombre, jd.id === myPlayerIdx);
-      j.pasado = jd.pasado; j.terminado = jd.terminado;
-      j.posicion = jd.posicion; j.rolPrev = jd.rolPrev;
-      return j;
-    });
-  } else {
-    state.jugadores.forEach((jd, i) => {
-      const j = jugadores[i];
-      j.nombre = jd.nombre; j.pasado = jd.pasado;
-      j.terminado = jd.terminado; j.posicion = jd.posicion;
-      j.rolPrev = jd.rolPrev;
-    });
-  }
-
-  // Restore my own hand
-  const myData = state.jugadores[myPlayerIdx];
-  if(myData && myData.mano){
-    jugadores[myPlayerIdx].mano = myData.mano.map(cd => {
-      const c = new Carta(cd.value, cd.suit);
-      c.jokerVal = cd.jokerVal;
-      return c;
-    });
-  }
-
-  // Restore mesa
-  mesaCartas = (state.mesaCartas||[]).map(cd => {
-    const c = new Carta(cd.value, cd.suit);
-    c.jokerVal = cd.jokerVal;
-    return c;
-  });
-
-  mesaCantidad   = state.mesaCantidad || 0;
-  turnoIdx       = state.turnoIdx;
-  ultimoEnJugar  = state.ultimoEnJugar;
-  numRonda       = state.numRonda || 0;
-  gameOver       = state.gameOver || false;
-  primeraRonda   = state.primeraRonda !== undefined ? state.primeraRonda : true;
-
-  if(state.statusMsg) setStatus(state.statusMsg);
-
-  // Handle exchange pending for this guest
-  if(state.exchangePending && state.exchangePending.giverIdx === myPlayerIdx){
-    const ep = state.exchangePending;
-    if(!exchangePending){
-      exchangePending = {
-        giver: jugadores[ep.giverIdx],
-        receiver: jugadores[ep.receiverIdx],
-        count: ep.count,
-        selected: []
-      };
-      openExchangeModal(exchangePending.giver, exchangePending.receiver, ep.count);
+    } else if(!state.exchangePending){
+      if(exchangePending){ document.getElementById('modal-exchange').classList.remove('show'); }
+      exchangePending=null;
     }
-  } else if(state.exchangePending === null){
-    exchangePending = null;
-    document.getElementById('modal-exchange').classList.remove('show');
-  }
 
-  renderAll();
+    renderBots(); renderPlayerHand(); renderTable(); renderBelowTable(); updateControls();
 
-  if(state.gameOver){
-    // Show results
-    const orden = state.finishOrder.map(id => jugadores[id]).filter(Boolean);
-    orden.forEach((j,i) => { j.posicion = i+1; });
-    finishOrder = orden;
-    setTimeout(showResults, 800);
-  }
-}
+    if(state.gameOver && finishOrder.length===0){
+      finishOrder=state.finishOrder.map(id=>jugadores[id]).filter(Boolean);
+      finishOrder.forEach((j,i)=>{ j.posicion=i+1; });
+      setTimeout(showResults,800);
+    }
+  },
 
-// ── GUEST SENDS ACTIONS ───────────────────────────────────
-function guestSendAction(action){
-  if(hostConn && hostConn.open){
-    hostConn.send({ type:'ACTION', action });
-  }
-}
+  handleHostMsg(conn, data){
+    const gInfo = Object.values(this.guests).find(g=>g.conn===conn);
+    if(!gInfo) return;
+    if(data.type==='NAME'){
+      gInfo.name=data.name; nombres[gInfo.idx]=data.name;
+      if(jugadores[gInfo.idx]) jugadores[gInfo.idx].nombre=data.name;
+      renderWaitPlayers(); return;
+    }
+    if(data.type==='ACTION'){
+      this.applyGuestAction(gInfo.idx, data.action);
+    }
+  },
 
-// Intercept playSelected / passTurn for guests
-const _origPlaySelected = playSelected;
-const _origPassTurn = passTurn;
-
-function playSelected(){
-  if(!onlineMode || isHost){ _origPlaySelected(); return; }
-  if(turnoIdx !== myPlayerIdx) return;
-  if(selected.length === 0) return;
-  const j = jugadores[myPlayerIdx];
-  const cartas = selected.map(i => j.mano[i]);
-  const hasJoker = cartas.some(c => c.esComodin);
-
-  if(hasJoker){
-    const normales = cartas.filter(c => !c.esComodin);
-    if(normales.length > 0){
-      const valBase = normales[0].value;
-      const mesaOrd = mesaCartas.length > 0 ? mesaCartas[0].effOrder() : -1;
-      if(VORDER[valBase] > mesaOrd || mesaCartas.length === 0){
-        guestSendAction({ type:'PLAY', indices:[...selected], jokerVal: valBase });
-        selected = [];
-        return;
+  applyGuestAction(playerIdx, action){
+    if(turnoIdx!==playerIdx) return;
+    const j=jugadores[playerIdx];
+    if(action.type==='PLAY'){
+      const cartas=action.indices.map(i=>j.mano[i]);
+      if(action.jokerVal) cartas.filter(c=>c.esComodin).forEach(c=>{c.jokerVal=action.jokerVal;});
+      doPlay(j,cartas);
+    }
+    if(action.type==='PASS'){
+      j.pasado=true; selected=[]; turnoIdx=nextActive(j.id);
+      setStatus(`${j.nombre} pasó`); advanceTurn();
+    }
+    if(action.type==='EXCHANGE'){
+      if(exchangePending && exchangePending.giver.id===playerIdx){
+        const {giver,receiver}=exchangePending;
+        const toGive=action.indices.map(i=>giver.mano[i]);
+        action.indices.slice().sort((a,b)=>b-a).forEach(i=>giver.mano.splice(i,1));
+        toGive.forEach(c=>receiver.mano.push(c));
+        giver.sortHand(); receiver.sortHand();
+        exchangePending=null;
+        document.getElementById('modal-exchange').classList.remove('show');
+        setTimeout(processExchangeQueue,400);
       }
     }
-    // Open joker picker locally, then send
-    openJokerForGuestLocal(cartas);
-    return;
   }
-  guestSendAction({ type:'PLAY', indices:[...selected] });
-  selected = [];
-}
+};
 
-function passTurn(){
-  if(!onlineMode || isHost){ _origPassTurn(); return; }
-  if(turnoIdx !== myPlayerIdx) return;
-  guestSendAction({ type:'PASS' });
-  selected = [];
-}
-
-function openJokerForGuestLocal(cartas){
-  const normales = cartas.filter(c => !c.esComodin);
-  const valBase = normales.length > 0 ? normales[0].value : null;
-  const mesaOrd = mesaCartas.length > 0 ? mesaCartas[0].effOrder() : -1;
-  const opciones = VALUES.filter(v => VORDER[v] > mesaOrd && (!valBase || VORDER[v] >= VORDER[valBase]));
-  if(!opciones.includes('A')) opciones.push('A');
-
-  document.getElementById('joker-sub').textContent = '¿Qué valor querés asignarle al comodín?';
-  const cont = document.getElementById('joker-values'); cont.innerHTML = '';
-  opciones.forEach(v => {
-    const btn = document.createElement('button'); btn.className = 'jv-btn'; btn.textContent = v;
-    btn.onclick = () => {
-      closeJoker();
-      guestSendAction({ type:'PLAY', indices:[...selected], jokerVal: v });
-      selected = [];
+// ── Joker picker for guests ────────────────────────────────
+function openJokerForNet(cartas){
+  const normales=cartas.filter(c=>!c.esComodin);
+  const valBase=normales.length>0?normales[0].value:null;
+  const mesaOrd=mesaCartas.length>0?mesaCartas[0].effOrder():-1;
+  const opts=VALUES.filter(v=>VORDER[v]>mesaOrd&&(!valBase||VORDER[v]>=VORDER[valBase]));
+  if(!opts.includes('A')) opts.push('A');
+  document.getElementById('joker-sub').textContent='¿Qué valor querés asignarle al comodín?';
+  const cont=document.getElementById('joker-values'); cont.innerHTML='';
+  opts.forEach(v=>{
+    const btn=document.createElement('button'); btn.className='jv-btn'; btn.textContent=v;
+    btn.onclick=()=>{
+      document.getElementById('modal-joker').classList.remove('show');
+      NET.sendAction({type:'PLAY', indices:[...NET.pendingIdx], jokerVal:v});
+      selected=[]; NET.pendingIdx=[];
     };
     cont.appendChild(btn);
   });
   document.getElementById('modal-joker').classList.add('show');
 }
 
-// Override confirmExchange for guests
-const _origConfirmExchange = confirmExchange;
-function confirmExchange(){
-  if(!onlineMode || isHost){ _origConfirmExchange(); return; }
-  if(!exchangePending) return;
-  const {selected} = exchangePending;
-  guestSendAction({ type:'EXCHANGE', indices:[...selected] });
-  document.getElementById('modal-exchange').classList.remove('show');
-  exchangePending = null;
+// ── UI helpers ────────────────────────────────────────────
+function openLobby(){
+  const c=document.getElementById('lobby-content');
+  c.innerHTML=`
+    <div style="color:rgba(240,232,208,.6);font-style:italic;font-size:.9rem;margin-bottom:20px">Jugá con amigos en cualquier red</div>
+    <div style="display:flex;flex-direction:column;gap:12px;">
+      <button class="btn primary" onclick="hostFlow()" style="width:100%;padding:14px">🏠 Crear partida (Host)</button>
+      <button class="btn" onclick="guestFlow()" style="width:100%;padding:14px">🎮 Unirse a partida</button>
+      <button class="btn" onclick="closeLobby()" style="width:100%;font-size:.65rem;opacity:.6;padding:8px">Cancelar</button>
+    </div>`;
+  document.getElementById('modal-lobby').classList.add('show');
 }
+function closeLobby(){ document.getElementById('modal-lobby').classList.remove('show'); }
 
-// ── HOST: BROADCAST AFTER EVERY STATE CHANGE ─────────────
-// Wrap renderAll to also broadcast when host
-const _origRenderAll = renderAll;
-function renderAll(){
-  _origRenderAll();
-  if(onlineMode && isHost) broadcastState();
-}
-
-// Also broadcast when exchange modal opens (so guest sees it)
-const _origOpenExchangeModal = openExchangeModal;
-function openExchangeModal(giver, receiver, count){
-  _origOpenExchangeModal(giver, receiver, count);
-  if(onlineMode && isHost && !giver.esHumano && giver.id !== 0){
-    // Guest needs to see exchange modal
-    const conn = Object.values(guestConns).find(c => c.metadata.playerIdx === giver.id);
-    if(conn) conn.send({
-      type:'ASK_EXCHANGE',
-      giverIdx: giver.id, receiverIdx: receiver.id, count
-    });
-    // Hide modal on host side since it's for the guest
-    document.getElementById('modal-exchange').classList.remove('show');
-  }
-}
-
-// ── WAITING ROOM HELPERS ──────────────────────────────────
 function showWaiting(title, sub){
-  document.getElementById('wait-title').innerHTML = title;
-  document.getElementById('wait-sub').textContent = sub;
+  document.getElementById('wait-title').innerHTML=title;
+  document.getElementById('wait-sub').textContent=sub;
   document.getElementById('modal-waiting').classList.add('show');
 }
 
 function renderWaitPlayers(){
-  const cont = document.getElementById('wait-players');
-  cont.innerHTML = '';
-  const total = 1 + Object.keys(guestConns).length;
-  // Host
-  const hostRow = document.createElement('div');
-  hostRow.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(201,168,76,.1);font-size:.85rem;';
-  hostRow.innerHTML = `<span style="color:var(--gold);font-family:'Cinzel',serif;font-size:.6rem">J1</span> <span>${nombres[0]}</span> <span style="font-size:.7rem;color:rgba(201,168,76,.5)">(host)</span>`;
-  cont.appendChild(hostRow);
-  // Guests
-  Object.values(guestConns).forEach((conn, i) => {
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(201,168,76,.1);font-size:.85rem;';
-    row.innerHTML = `<span style="color:var(--gold);font-family:'Cinzel',serif;font-size:.6rem">J${i+2}</span> <span>${conn.metadata.name||'Conectando...'}</span> <span style="color:#80c890;font-size:.7rem">● conectado</span>`;
-    cont.appendChild(row);
-  });
-  const needed = expectedPlayers - total;
-  if(needed > 0){
-    const row = document.createElement('div');
-    row.style.cssText = 'padding:6px 0;font-size:.8rem;color:rgba(240,232,208,.4);font-style:italic;';
-    row.textContent = `Esperando ${needed} jugador${needed>1?'es'} más...`;
-    cont.appendChild(row);
+  const cont=document.getElementById('wait-players'); cont.innerHTML='';
+  const row=(label,name,badge)=>{
+    const d=document.createElement('div');
+    d.style.cssText='display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(201,168,76,.1);font-size:.85rem;';
+    d.innerHTML=`<span style="color:var(--gold);font-family:'Cinzel',serif;font-size:.6rem">${label}</span><span>${name}</span><span style="font-size:.7rem;opacity:.6">${badge}</span>`;
+    cont.appendChild(d);
+  };
+  row('J1', nombres[0], '(host)');
+  Object.values(NET.guests).forEach((g,i)=>row(`J${i+2}`, g.name||'Conectando...','● conectado'));
+  const need=numJugadores-(1+Object.keys(NET.guests).length);
+  if(need>0){
+    const d=document.createElement('div');
+    d.style.cssText='padding:6px 0;font-size:.8rem;color:rgba(240,232,208,.4);font-style:italic;';
+    d.textContent=`Esperando ${need} jugador${need>1?'es'} más...`;
+    cont.appendChild(d);
   }
 }
 
+function updateStartBtn(){
+  const total=1+Object.keys(NET.guests).length;
+  const btns=document.getElementById('wait-btns');
+  let b=document.getElementById('btn-net-start');
+  if(total>=2){
+    if(!b){ b=document.createElement('button'); b.id='btn-net-start'; b.className='btn primary'; b.onclick=hostBegin; btns.insertBefore(b,btns.firstChild); }
+    b.textContent=`Comenzar (${total} jugadores)`;
+  } else { if(b) b.remove(); }
+}
+
 function cancelOnline(){
-  if(peer){ try{ peer.destroy(); }catch(e){} peer=null; }
-  onlineMode = false; isHost = false;
-  guestConns = {}; hostConn = null; myPlayerIdx = null;
+  if(NET.peer){ try{NET.peer.destroy();}catch(e){} NET.peer=null; }
+  NET.online=false; NET.isHost=false; NET.guests={}; NET.hostConn=null;
   document.getElementById('modal-waiting').classList.remove('show');
-  document.getElementById('online-bar').style.display = 'none';
-  // Restore single-player game
+  document.getElementById('online-bar').style.display='none';
   hardNewGame();
+}
+
+// ── HOST ──────────────────────────────────────────────────
+function hostFlow(){
+  closeLobby();
+  NET.roomCode=Math.random().toString(36).substring(2,6).toUpperCase();
+  NET.isHost=true; NET.myIdx=0; NET.guests={};
+  showWaiting('Creando sala...','Conectando...');
+  document.getElementById('wait-btns').innerHTML='<button class="btn" onclick="cancelOnline()">Cancelar</button>';
+
+  NET.peer=new Peer('PRES-'+NET.roomCode, {debug:0});
+  NET.peer.on('open',()=>{
+    document.getElementById('wait-title').innerHTML=
+      `Sala: <span style="color:var(--gold);font-size:1.4rem;letter-spacing:6px">${NET.roomCode}</span>`;
+    document.getElementById('wait-sub').textContent='Compartí este código con los jugadores';
+    renderWaitPlayers(); updateStartBtn();
+  });
+  NET.peer.on('connection', conn=>{
+    conn.on('open',()=>{
+      const idx=1+Object.keys(NET.guests).length;
+      NET.guests[conn.peer]={conn, idx, name:`Jugador ${idx+1}`};
+      conn.send({type:'ASSIGN', idx, roomCode:NET.roomCode});
+      conn.on('data', data=>NET.handleHostMsg(conn,data));
+      conn.on('close',()=>{ delete NET.guests[conn.peer]; renderWaitPlayers(); updateStartBtn(); });
+      renderWaitPlayers(); updateStartBtn();
+    });
+  });
+  NET.peer.on('error', e=>{ document.getElementById('wait-sub').textContent='Error: '+e.message; });
+}
+
+function hostBegin(){
+  const total=1+Object.keys(NET.guests).length;
+  numJugadores=total;
+  Object.values(NET.guests).forEach(g=>{ nombres[g.idx]=g.name||nombres[g.idx]; });
+  const allNames={};
+  for(let i=0;i<total;i++) allNames[i]=nombres[i];
+  Object.values(NET.guests).forEach(g=>{
+    g.conn.send({type:'START', playerIdx:g.idx, numJugadores:total, names:allNames});
+  });
+  document.getElementById('modal-waiting').classList.remove('show');
+  NET.online=true;
+  document.getElementById('online-bar').style.display='block';
+  rolesAnteriores={}; dealStartId=-1;
+  startGame();
+}
+
+// ── GUEST ─────────────────────────────────────────────────
+function guestFlow(){
+  closeLobby();
+  document.getElementById('modal-lobby').classList.add('show');
+  document.getElementById('lobby-content').innerHTML=`
+    <div style="color:rgba(240,232,208,.6);font-size:.9rem;margin-bottom:14px">Ingresá el código de sala</div>
+    <input id="room-inp" maxlength="4" placeholder="XXXX" style="
+      font-family:'Cinzel',serif;font-size:1.6rem;letter-spacing:8px;text-align:center;
+      text-transform:uppercase;width:100%;padding:12px;margin-bottom:14px;
+      background:rgba(255,255,255,.06);border:1px solid var(--gold);
+      color:var(--gold);border-radius:6px;outline:none;">
+    <div style="display:flex;flex-direction:column;gap:8px;">
+      <button class="btn primary" onclick="guestConnect()" style="width:100%;padding:12px">Conectar</button>
+      <button class="btn" onclick="closeLobby()" style="width:100%;font-size:.65rem;opacity:.6;padding:8px">Cancelar</button>
+    </div>`;
+  setTimeout(()=>{ const i=document.getElementById('room-inp'); if(i){i.focus(); i.onkeydown=e=>{if(e.key==='Enter')guestConnect();};} },100);
+}
+
+function guestConnect(){
+  const inp=document.getElementById('room-inp');
+  if(!inp) return;
+  const code=inp.value.trim().toUpperCase();
+  if(code.length!==4){ toast('El código debe tener 4 letras'); return; }
+  closeLobby();
+  showWaiting('Conectando...', `Buscando sala ${code}...`);
+  document.getElementById('wait-btns').innerHTML='<button class="btn" onclick="cancelOnline()">Cancelar</button>';
+
+  NET.roomCode=code; NET.isHost=false;
+  NET.peer=new Peer({debug:0});
+  NET.peer.on('open',()=>{
+    NET.hostConn=NET.peer.connect('PRES-'+code,{reliable:true});
+    NET.hostConn.on('open',()=>{
+      NET.hostConn.send({type:'NAME', name:nombres[0]});
+      document.getElementById('wait-sub').textContent='Esperando que el host inicie...';
+    });
+    NET.hostConn.on('data', data=>{
+      if(data.type==='ASSIGN'){
+        NET.myIdx=data.idx;
+        document.getElementById('wait-title').textContent=`Unido ✓ — Sos el Jugador ${data.idx+1}`;
+        document.getElementById('wait-sub').textContent='Esperando que el host inicie la partida...';
+      }
+      if(data.type==='START'){
+        NET.myIdx=data.playerIdx; numJugadores=data.numJugadores;
+        Object.assign(nombres, data.names||{});
+        document.getElementById('modal-waiting').classList.remove('show');
+        NET.online=true;
+        document.getElementById('online-bar').style.display='block';
+        // Guest doesn't call startGame — wait for STATE
+        setStatus('Esperando la partida...');
+      }
+      if(data.type==='STATE'){
+        NET.applyState(data.state, NET.myIdx);
+      }
+    });
+    NET.hostConn.on('close',()=>{ toast('El host cerró la partida'); cancelOnline(); });
+  });
+  NET.peer.on('error',()=>{
+    document.getElementById('wait-title').textContent='No se encontró la sala';
+    document.getElementById('wait-sub').textContent='Verificá el código e intentá de nuevo';
+    document.getElementById('wait-btns').innerHTML=
+      '<button class="btn primary" onclick="guestFlow()">Reintentar</button><button class="btn" onclick="cancelOnline()">Cancelar</button>';
+  });
 }
 
 // ══════════════════════════════════════════════════════════
 startGame();
 </script>
-<!-- LOBBY MODAL -->
+<!-- ONLINE: Lobby -->
 <div class="overlay" id="modal-lobby">
   <div class="modal-box" style="padding:36px 44px;max-width:460px;">
     <div class="modal-title" style="font-size:1.2rem;margin-bottom:6px;">🌐 Multijugador</div>
     <div id="lobby-content"></div>
   </div>
 </div>
-
-<!-- WAITING ROOM -->
+<!-- ONLINE: Waiting room -->
 <div class="overlay" id="modal-waiting">
   <div class="modal-box" style="padding:36px 44px;max-width:460px;">
     <div class="modal-title" id="wait-title" style="font-size:1.1rem;margin-bottom:8px;"></div>
-    <div class="modal-sub" id="wait-sub"></div>
-    <div id="wait-players" style="margin:16px 0;text-align:left;"></div>
+    <div class="modal-sub" id="wait-sub" style="font-style:normal"></div>
+    <div id="wait-players" style="margin:16px 0;text-align:left;min-height:40px;"></div>
     <div id="wait-btns" style="display:flex;gap:10px;justify-content:center;margin-top:8px;"></div>
   </div>
 </div>
-
-<!-- ONLINE STATUS BAR -->
+<!-- ONLINE: Top bar indicator -->
 <div id="online-bar" style="display:none;position:fixed;top:0;left:0;right:0;height:3px;background:var(--gold);z-index:200;opacity:.7;"></div>
-
 </body>
 </html>
