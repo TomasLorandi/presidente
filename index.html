@@ -1692,7 +1692,7 @@ function renderWaitPlayers(){
   if(need>0){
     const d=document.createElement('div');
     d.style.cssText='padding:6px 0;font-size:.8rem;color:rgba(240,232,208,.4);font-style:italic;';
-    d.textContent=`Esperando ${need} jugador${need>1?'es'} más...`;
+    d.textContent=`Esperando ${need} jugador${need>1?'es':''} más...`;
     cont.appendChild(d);
   }
 }
