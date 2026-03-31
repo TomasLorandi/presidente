@@ -1490,178 +1490,218 @@ function openSettings(){
   buildRankEditor();
   document.getElementById('modal-settings').classList.add('show');
 }
-function closeSettings(){ document.getElementById('modal-settings').classList.remove('show'); }
+// ══════════════════════════════════════════════════════════
+//  MULTIPLAYER — NET (rewritten)
+// ══════════════════════════════════════════════════════════
+/*
+  ARCHITECTURE:
+  - Host runs the full game engine
+  - Guests send only ACTIONS (PLAY / PASS / EXCHANGE)
+  - Host broadcasts full STATE after every change
+  - On host: guest players have esHumano=true so bots skip them;
+    advanceTurn waits for their network action instead of running AI
+  - On guest: only myIdx player shows interactive hand;
+    other players shown as opponents
+*/
 
-// ══════════════════════════════════════════════════════════
-//  MULTIPLAYER — NET object
-// ══════════════════════════════════════════════════════════
 const NET = {
-  online: false,
-  isHost: false,
-  myIdx: 0,
-  peer: null,
-  hostConn: null,       // guest → host
-  guests: {},           // host → {peerId: {conn, idx, name}}
+  online:   false,
+  isHost:   false,
+  myIdx:    0,        // which jugadores[] index this client controls
+  peer:     null,
+  hostConn: null,     // guest → host
+  guests:   {},       // host: {peerId → {conn, idx, name}}
   roomCode: null,
-  pendingIdx: [],       // for joker selection on guest
+  pendingJokerIdx: [] // card indices waiting for joker value (guest)
+};
 
-  sendAction(action){
-    if(this.hostConn && this.hostConn.open)
-      this.hostConn.send({type:'ACTION', action});
-  },
+// ── helpers ───────────────────────────────────────────────
+NET.isGuestSlot = function(idx){
+  // Returns true if this player index belongs to a connected guest (not a bot)
+  return Object.values(this.guests).some(g => g.idx === idx);
+};
 
-  broadcast(){
-    const state = this.serialize();
-    Object.values(this.guests).forEach(g => {
-      try{ g.conn.send({type:'STATE', state, forIdx: g.idx}); }catch(e){}
+NET.sendToHost = function(msg){
+  if(this.hostConn && this.hostConn.open) this.hostConn.send(msg);
+};
+
+NET.broadcast = function(){
+  if(!this.online || !this.isHost) return;
+  const base = this.buildState();
+  Object.values(this.guests).forEach(g => {
+    // Send state personalised: full hand only for this guest's index
+    g.conn.send({ type:'STATE', state: base, forIdx: g.idx });
+  });
+};
+
+NET.buildState = function(){
+  return {
+    jugadores: jugadores.map(j => ({
+      id: j.id, nombre: j.nombre,
+      pasado: j.pasado, terminado: j.terminado,
+      posicion: j.posicion, rolPrev: j.rolPrev,
+      // Send full hand — guest will only render their own cards
+      mano: j.mano.map(c => ({value:c.value, suit:c.suit, jokerVal:c.jokerVal}))
+    })),
+    mesaCartas:    mesaCartas.map(c => ({value:c.value, suit:c.suit, jokerVal:c.jokerVal})),
+    mesaCantidad, turnoIdx, ultimoEnJugar, numRonda,
+    gameOver, primeraRonda,
+    finishOrder:   finishOrder.map(j => j.id),
+    exchangePending: exchangePending
+      ? { giverIdx: exchangePending.giver.id, receiverIdx: exchangePending.receiver.id, count: exchangePending.count }
+      : null,
+    statusMsg:   document.getElementById('status-msg').textContent,
+    aboveMsg:    document.getElementById('above-table-msg').textContent
+  };
+};
+
+NET.applyState = function(state, myIdx){
+  const n = state.jugadores.length;
+
+  // Rebuild or update jugadores
+  if(jugadores.length !== n){
+    jugadores = state.jugadores.map(jd => {
+      const j = new Jugador(jd.id, jd.nombre, jd.id === myIdx);
+      j.pasado = jd.pasado; j.terminado = jd.terminado;
+      j.posicion = jd.posicion; j.rolPrev = jd.rolPrev; j.mano = [];
+      return j;
     });
-  },
+  } else {
+    state.jugadores.forEach((jd, i) => {
+      jugadores[i].nombre    = jd.nombre;
+      jugadores[i].pasado    = jd.pasado;
+      jugadores[i].terminado = jd.terminado;
+      jugadores[i].posicion  = jd.posicion;
+      jugadores[i].rolPrev   = jd.rolPrev;
+      jugadores[i].esHumano  = (jd.id === myIdx);
+    });
+  }
 
-  serialize(){
-    return {
-      jugadores: jugadores.map(j=>({
-        id:j.id, nombre:j.nombre, pasado:j.pasado,
-        terminado:j.terminado, posicion:j.posicion, rolPrev:j.rolPrev,
-        mano: j.mano.map(c=>({value:c.value,suit:c.suit,jokerVal:c.jokerVal}))
-      })),
-      mesaCartas: mesaCartas.map(c=>({value:c.value,suit:c.suit,jokerVal:c.jokerVal})),
-      mesaCantidad, turnoIdx, ultimoEnJugar, numRonda,
-      finishOrder: finishOrder.map(j=>j.id),
-      gameOver, primeraRonda,
-      exchangePending: exchangePending ? {
-        giverIdx: exchangePending.giver.id,
-        receiverIdx: exchangePending.receiver.id,
-        count: exchangePending.count
-      } : null,
-      statusMsg: document.getElementById('status-msg').textContent,
-      aboveMsg: document.getElementById('above-table-msg').textContent
-    };
-  },
-
-  applyState(state, myIdx){
-    // Rebuild jugadores
-    if(jugadores.length !== state.jugadores.length){
-      jugadores = state.jugadores.map(jd=>{
-        const j=new Jugador(jd.id, jd.nombre, jd.id===myIdx);
-        j.pasado=jd.pasado; j.terminado=jd.terminado;
-        j.posicion=jd.posicion; j.rolPrev=jd.rolPrev;
-        j.mano=jd.mano.map(cd=>{ const c=new Carta(cd.value,cd.suit); c.jokerVal=cd.jokerVal; return c; });
-        return j;
+  // Restore hands — full hand only for my own index, count only for others
+  state.jugadores.forEach((jd, i) => {
+    if(i === myIdx){
+      jugadores[i].mano = jd.mano.map(cd => {
+        const c = new Carta(cd.value, cd.suit);
+        c.jokerVal = cd.jokerVal; return c;
       });
     } else {
-      state.jugadores.forEach((jd,i)=>{
-        const j=jugadores[i];
-        j.nombre=jd.nombre; j.pasado=jd.pasado;
-        j.terminado=jd.terminado; j.posicion=jd.posicion; j.rolPrev=jd.rolPrev;
-        // Only update my own hand from state
-        if(i===myIdx){
-          j.mano=jd.mano.map(cd=>{ const c=new Carta(cd.value,cd.suit); c.jokerVal=cd.jokerVal; return c; });
-        }
-      });
+      // Keep a dummy array of the right length so card-count renders correctly
+      jugadores[i].mano = Array(jd.mano.length).fill(null).map(() => new Carta('?',''));
     }
+  });
 
-    mesaCartas=(state.mesaCartas||[]).map(cd=>{
-      const c=new Carta(cd.value,cd.suit); c.jokerVal=cd.jokerVal; return c;
-    });
-    mesaCantidad  = state.mesaCantidad||0;
-    turnoIdx      = state.turnoIdx;
-    ultimoEnJugar = state.ultimoEnJugar;
-    numRonda      = state.numRonda||0;
-    gameOver      = state.gameOver||false;
-    primeraRonda  = state.primeraRonda!==undefined ? state.primeraRonda : true;
+  mesaCartas = (state.mesaCartas || []).map(cd => {
+    const c = new Carta(cd.value, cd.suit); c.jokerVal = cd.jokerVal; return c;
+  });
+  mesaCantidad  = state.mesaCantidad  || 0;
+  turnoIdx      = state.turnoIdx;
+  ultimoEnJugar = state.ultimoEnJugar;
+  numRonda      = state.numRonda || 0;
+  gameOver      = state.gameOver || false;
+  primeraRonda  = state.primeraRonda !== undefined ? state.primeraRonda : true;
 
-    if(state.statusMsg) setStatus(state.statusMsg);
-    if(state.aboveMsg)  showAboveMsg(state.aboveMsg);
+  if(state.statusMsg) setStatus(state.statusMsg);
+  if(state.aboveMsg)  showAboveMsg(state.aboveMsg);
 
-    // Exchange for this guest
-    if(state.exchangePending && state.exchangePending.giverIdx===myIdx){
-      const ep=state.exchangePending;
-      if(!exchangePending){
-        exchangePending={
-          giver:jugadores[ep.giverIdx], receiver:jugadores[ep.receiverIdx],
-          count:ep.count, selected:[]
-        };
-        openExchangeModal(exchangePending.giver, exchangePending.receiver, ep.count);
-      }
-    } else if(!state.exchangePending){
-      if(exchangePending){ document.getElementById('modal-exchange').classList.remove('show'); }
-      exchangePending=null;
+  // Exchange: show modal only if it's this guest's turn to give
+  if(state.exchangePending && state.exchangePending.giverIdx === myIdx){
+    if(!exchangePending){
+      exchangePending = {
+        giver:    jugadores[state.exchangePending.giverIdx],
+        receiver: jugadores[state.exchangePending.receiverIdx],
+        count:    state.exchangePending.count,
+        selected: []
+      };
+      openExchangeModal(exchangePending.giver, exchangePending.receiver, exchangePending.count);
     }
+  } else if(!state.exchangePending){
+    exchangePending = null;
+    document.getElementById('modal-exchange').classList.remove('show');
+  }
 
-    renderBots(); renderPlayerHand(); renderTable(); renderBelowTable(); updateControls();
+  // Re-render everything from guest's perspective
+  renderBots(); renderPlayerHand(); renderTable(); renderBelowTable(); updateControls();
 
-    if(state.gameOver && finishOrder.length===0){
-      finishOrder=state.finishOrder.map(id=>jugadores[id]).filter(Boolean);
-      finishOrder.forEach((j,i)=>{ j.posicion=i+1; });
-      setTimeout(showResults,800);
-    }
-  },
+  // Game over
+  if(state.gameOver && !finishOrder.length){
+    finishOrder = (state.finishOrder || []).map(id => jugadores[id]).filter(Boolean);
+    finishOrder.forEach((j,i) => { j.posicion = i + 1; });
+    setTimeout(showResults, 800);
+  }
+};
 
-  handleHostMsg(conn, data){
-    const gInfo = Object.values(this.guests).find(g=>g.conn===conn);
-    if(!gInfo) return;
-    if(data.type==='NAME'){
-      gInfo.name=data.name; nombres[gInfo.idx]=data.name;
-      if(jugadores[gInfo.idx]) jugadores[gInfo.idx].nombre=data.name;
-      renderWaitPlayers(); return;
-    }
-    if(data.type==='ACTION'){
-      this.applyGuestAction(gInfo.idx, data.action);
-    }
-  },
+NET.handleGuestAction = function(guestIdx, action){
+  if(turnoIdx !== guestIdx) return; // not their turn, ignore
+  const j = jugadores[guestIdx];
 
-  applyGuestAction(playerIdx, action){
-    if(turnoIdx!==playerIdx) return;
-    const j=jugadores[playerIdx];
-    if(action.type==='PLAY'){
-      const cartas=action.indices.map(i=>j.mano[i]);
-      if(action.jokerVal) cartas.filter(c=>c.esComodin).forEach(c=>{c.jokerVal=action.jokerVal;});
-      doPlay(j,cartas);
-    }
-    if(action.type==='PASS'){
-      j.pasado=true; selected=[]; turnoIdx=nextActive(j.id);
-      setStatus(`${j.nombre} pasó`); advanceTurn();
-    }
-    if(action.type==='EXCHANGE'){
-      if(exchangePending && exchangePending.giver.id===playerIdx){
-        const {giver,receiver}=exchangePending;
-        const toGive=action.indices.map(i=>giver.mano[i]);
-        action.indices.slice().sort((a,b)=>b-a).forEach(i=>giver.mano.splice(i,1));
-        toGive.forEach(c=>receiver.mano.push(c));
-        giver.sortHand(); receiver.sortHand();
-        exchangePending=null;
-        document.getElementById('modal-exchange').classList.remove('show');
-        setTimeout(processExchangeQueue,400);
-      }
+  if(action.type === 'PLAY'){
+    const cartas = action.indices.map(i => j.mano[i]);
+    if(action.jokerVal) cartas.filter(c => c.esComodin).forEach(c => { c.jokerVal = action.jokerVal; });
+    if(!validatePlay(cartas)) return;
+    doPlay(j, cartas);
+  }
+
+  if(action.type === 'PASS'){
+    j.pasado = true; selected = [];
+    turnoIdx = nextActive(j.id);
+    setStatus(`${j.nombre} pasó`);
+    advanceTurn();
+  }
+
+  if(action.type === 'EXCHANGE'){
+    if(exchangePending && exchangePending.giver.id === guestIdx){
+      const { giver, receiver } = exchangePending;
+      const toGive = action.indices.map(i => giver.mano[i]);
+      action.indices.slice().sort((a,b) => b - a).forEach(i => giver.mano.splice(i, 1));
+      toGive.forEach(c => receiver.mano.push(c));
+      giver.sortHand(); receiver.sortHand();
+      exchangePending = null;
+      document.getElementById('modal-exchange').classList.remove('show');
+      setTimeout(processExchangeQueue, 400);
     }
   }
 };
 
-// ── Joker picker for guests ────────────────────────────────
+// ── Patch advanceTurn: host waits for guest instead of running bot ──
+// We patch doBotTurn to skip online guest slots
+const _origDoBotTurn = doBotTurn;
+function doBotTurn(){
+  if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
+    // This is a guest's turn — host waits for their network action
+    // Just re-render so the UI shows whose turn it is
+    renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
+    setStatus(`Esperando a ${jugadores[turnoIdx].nombre}...`);
+    NET.broadcast(); // make sure guest sees it's their turn
+    return;
+  }
+  _origDoBotTurn();
+}
+
+// ── Joker picker for guests ───────────────────────────────
 function openJokerForNet(cartas){
-  const normales=cartas.filter(c=>!c.esComodin);
-  const valBase=normales.length>0?normales[0].value:null;
-  const mesaOrd=mesaCartas.length>0?mesaCartas[0].effOrder():-1;
-  const opts=VALUES.filter(v=>VORDER[v]>mesaOrd&&(!valBase||VORDER[v]>=VORDER[valBase]));
+  const normales = cartas.filter(c => !c.esComodin);
+  const valBase  = normales.length > 0 ? normales[0].value : null;
+  const mesaOrd  = mesaCartas.length > 0 ? mesaCartas[0].effOrder() : -1;
+  const opts = VALUES.filter(v => VORDER[v] > mesaOrd && (!valBase || VORDER[v] >= VORDER[valBase]));
   if(!opts.includes('A')) opts.push('A');
-  document.getElementById('joker-sub').textContent='¿Qué valor querés asignarle al comodín?';
-  const cont=document.getElementById('joker-values'); cont.innerHTML='';
-  opts.forEach(v=>{
-    const btn=document.createElement('button'); btn.className='jv-btn'; btn.textContent=v;
-    btn.onclick=()=>{
+
+  document.getElementById('joker-sub').textContent = '¿Qué valor querés asignarle al comodín?';
+  const cont = document.getElementById('joker-values'); cont.innerHTML = '';
+  opts.forEach(v => {
+    const btn = document.createElement('button'); btn.className = 'jv-btn'; btn.textContent = v;
+    btn.onclick = () => {
       document.getElementById('modal-joker').classList.remove('show');
-      NET.sendAction({type:'PLAY', indices:[...NET.pendingIdx], jokerVal:v});
-      selected=[]; NET.pendingIdx=[];
+      NET.sendToHost({ type:'ACTION', action:{ type:'PLAY', indices:[...NET.pendingJokerIdx], jokerVal:v } });
+      selected = []; NET.pendingJokerIdx = [];
     };
     cont.appendChild(btn);
   });
   document.getElementById('modal-joker').classList.add('show');
 }
 
-// ── UI helpers ────────────────────────────────────────────
+// ── UI ────────────────────────────────────────────────────
 function openLobby(){
-  const c=document.getElementById('lobby-content');
-  c.innerHTML=`
+  document.getElementById('lobby-content').innerHTML = `
     <div style="color:rgba(240,232,208,.6);font-style:italic;font-size:.9rem;margin-bottom:20px">Jugá con amigos en cualquier red</div>
     <div style="display:flex;flex-direction:column;gap:12px;">
       <button class="btn primary" onclick="hostFlow()" style="width:100%;padding:14px">🏠 Crear partida (Host)</button>
@@ -1673,97 +1713,134 @@ function openLobby(){
 function closeLobby(){ document.getElementById('modal-lobby').classList.remove('show'); }
 
 function showWaiting(title, sub){
-  document.getElementById('wait-title').innerHTML=title;
-  document.getElementById('wait-sub').textContent=sub;
+  document.getElementById('wait-title').innerHTML = title;
+  document.getElementById('wait-sub').textContent  = sub;
   document.getElementById('modal-waiting').classList.add('show');
 }
 
 function renderWaitPlayers(){
-  const cont=document.getElementById('wait-players'); cont.innerHTML='';
-  const row=(label,name,badge)=>{
-    const d=document.createElement('div');
-    d.style.cssText='display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(201,168,76,.1);font-size:.85rem;';
-    d.innerHTML=`<span style="color:var(--gold);font-family:'Cinzel',serif;font-size:.6rem">${label}</span><span>${name}</span><span style="font-size:.7rem;opacity:.6">${badge}</span>`;
+  const cont = document.getElementById('wait-players'); cont.innerHTML = '';
+  const mk = (label, name, badge, color) => {
+    const d = document.createElement('div');
+    d.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(201,168,76,.1);font-size:.85rem;';
+    d.innerHTML = `<span style="color:var(--gold);font-family:'Cinzel',serif;font-size:.6rem">${label}</span><span>${name}</span><span style="font-size:.7rem;color:${color};opacity:.8">${badge}</span>`;
     cont.appendChild(d);
   };
-  row('J1', nombres[0], '(host)');
-  Object.values(NET.guests).forEach((g,i)=>row(`J${i+2}`, g.name||'Conectando...','● conectado'));
-  const need=numJugadores-(1+Object.keys(NET.guests).length);
-  if(need>0){
-    const d=document.createElement('div');
-    d.style.cssText='padding:6px 0;font-size:.8rem;color:rgba(240,232,208,.4);font-style:italic;';
-    d.textContent=`Esperando ${need} jugador${need>1?'es':''} más...`;
+  mk('J1', nombres[0], '(host)', 'rgba(240,232,208,.5)');
+  Object.values(NET.guests).sort((a,b)=>a.idx-b.idx).forEach(g => {
+    mk(`J${g.idx+1}`, g.name || 'Conectando...', '● conectado', '#90d4a0');
+  });
+  const need = numJugadores - 1 - Object.keys(NET.guests).length;
+  if(need > 0){
+    const d = document.createElement('div');
+    d.style.cssText = 'padding:6px 0;font-size:.8rem;color:rgba(240,232,208,.4);font-style:italic;';
+    d.textContent = `Esperando ${need} jugador${need > 1 ? 'es' : ''} más...`;
     cont.appendChild(d);
   }
 }
 
 function updateStartBtn(){
-  const total=1+Object.keys(NET.guests).length;
-  const btns=document.getElementById('wait-btns');
-  let b=document.getElementById('btn-net-start');
-  if(total>=2){
-    if(!b){ b=document.createElement('button'); b.id='btn-net-start'; b.className='btn primary'; b.onclick=hostBegin; btns.insertBefore(b,btns.firstChild); }
-    b.textContent=`Comenzar (${total} jugadores)`;
+  const total = 1 + Object.keys(NET.guests).length;
+  const btns  = document.getElementById('wait-btns');
+  let b = document.getElementById('btn-net-start');
+  if(total >= 2){
+    if(!b){ b = document.createElement('button'); b.id='btn-net-start'; b.className='btn primary'; b.onclick=hostBegin; btns.insertBefore(b, btns.firstChild); }
+    b.textContent = `Comenzar (${total} jugadores)`;
   } else { if(b) b.remove(); }
 }
 
 function cancelOnline(){
-  if(NET.peer){ try{NET.peer.destroy();}catch(e){} NET.peer=null; }
-  NET.online=false; NET.isHost=false; NET.guests={}; NET.hostConn=null;
+  if(NET.peer){ try{ NET.peer.destroy(); }catch(e){} NET.peer = null; }
+  NET.online = false; NET.isHost = false; NET.guests = {}; NET.hostConn = null;
   document.getElementById('modal-waiting').classList.remove('show');
-  document.getElementById('online-bar').style.display='none';
+  document.getElementById('online-bar').style.display = 'none';
   hardNewGame();
 }
 
 // ── HOST ──────────────────────────────────────────────────
 function hostFlow(){
   closeLobby();
-  NET.roomCode=Math.random().toString(36).substring(2,6).toUpperCase();
-  NET.isHost=true; NET.myIdx=0; NET.guests={};
-  showWaiting('Creando sala...','Conectando...');
-  document.getElementById('wait-btns').innerHTML='<button class="btn" onclick="cancelOnline()">Cancelar</button>';
+  NET.roomCode = Math.random().toString(36).substring(2,6).toUpperCase();
+  NET.isHost = true; NET.myIdx = 0; NET.guests = {};
+  showWaiting('Creando sala...', 'Conectando...');
+  document.getElementById('wait-btns').innerHTML = '<button class="btn" onclick="cancelOnline()">Cancelar</button>';
 
-  NET.peer=new Peer('PRES-'+NET.roomCode, {debug:0});
-  NET.peer.on('open',()=>{
-    document.getElementById('wait-title').innerHTML=
+  NET.peer = new Peer('PRES-' + NET.roomCode, { debug:0 });
+
+  NET.peer.on('open', () => {
+    document.getElementById('wait-title').innerHTML =
       `Sala: <span style="color:var(--gold);font-size:1.4rem;letter-spacing:6px">${NET.roomCode}</span>`;
-    document.getElementById('wait-sub').textContent='Compartí este código con los jugadores';
+    document.getElementById('wait-sub').textContent = 'Compartí este código con los jugadores';
     renderWaitPlayers(); updateStartBtn();
   });
-  NET.peer.on('connection', conn=>{
-    conn.on('open',()=>{
-      const idx=1+Object.keys(NET.guests).length;
-      NET.guests[conn.peer]={conn, idx, name:`Jugador ${idx+1}`};
-      conn.send({type:'ASSIGN', idx, roomCode:NET.roomCode});
-      conn.on('data', data=>NET.handleHostMsg(conn,data));
-      conn.on('close',()=>{ delete NET.guests[conn.peer]; renderWaitPlayers(); updateStartBtn(); });
+
+  NET.peer.on('connection', conn => {
+    conn.on('open', () => {
+      const idx = 1 + Object.keys(NET.guests).length;
+      NET.guests[conn.peer] = { conn, idx, name: `Jugador ${idx + 1}` };
+      conn.send({ type:'ASSIGN', idx, roomCode: NET.roomCode });
+
+      conn.on('data', data => {
+        if(data.type === 'NAME'){
+          NET.guests[conn.peer].name = data.name;
+          nombres[idx] = data.name;
+          renderWaitPlayers();
+        }
+        if(data.type === 'ACTION' && NET.online){
+          NET.handleGuestAction(NET.guests[conn.peer].idx, data.action);
+        }
+      });
+
+      conn.on('close', () => {
+        delete NET.guests[conn.peer];
+        renderWaitPlayers(); updateStartBtn();
+      });
+
       renderWaitPlayers(); updateStartBtn();
     });
   });
-  NET.peer.on('error', e=>{ document.getElementById('wait-sub').textContent='Error: '+e.message; });
+
+  NET.peer.on('error', e => {
+    document.getElementById('wait-sub').textContent = 'Error: ' + (e.message || e);
+  });
 }
 
 function hostBegin(){
-  const total=1+Object.keys(NET.guests).length;
-  numJugadores=total;
-  Object.values(NET.guests).forEach(g=>{ nombres[g.idx]=g.name||nombres[g.idx]; });
-  const allNames={};
-  for(let i=0;i<total;i++) allNames[i]=nombres[i];
-  Object.values(NET.guests).forEach(g=>{
-    g.conn.send({type:'START', playerIdx:g.idx, numJugadores:total, names:allNames});
+  const guestList = Object.values(NET.guests).sort((a,b) => a.idx - b.idx);
+  const total = 1 + guestList.length;
+  numJugadores = total;
+
+  // Update names
+  guestList.forEach(g => { nombres[g.idx] = g.name || nombres[g.idx] || `Jugador ${g.idx+1}`; });
+
+  const allNames = {};
+  for(let i = 0; i < total; i++) allNames[i] = nombres[i];
+
+  // Tell each guest their final index and to start
+  guestList.forEach(g => {
+    g.conn.send({ type:'START', playerIdx: g.idx, numJugadores: total, names: allNames });
   });
+
   document.getElementById('modal-waiting').classList.remove('show');
-  NET.online=true;
-  document.getElementById('online-bar').style.display='block';
-  rolesAnteriores={}; dealStartId=-1;
+  NET.online = true;
+  document.getElementById('online-bar').style.display = 'block';
+
+  rolesAnteriores = {}; dealStartId = -1;
+
+  // Start game — mark guest slots as "human" so bots don't run for them
+  // We do this by temporarily overriding how startGame builds jugadores
+  NET._guestIndices = guestList.map(g => g.idx);
   startGame();
+  // After startGame, mark guest players as esHumano=true on host
+  NET._guestIndices.forEach(i => { if(jugadores[i]) jugadores[i].esHumano = true; });
+  NET._guestIndices = [];
 }
 
 // ── GUEST ─────────────────────────────────────────────────
 function guestFlow(){
   closeLobby();
   document.getElementById('modal-lobby').classList.add('show');
-  document.getElementById('lobby-content').innerHTML=`
+  document.getElementById('lobby-content').innerHTML = `
     <div style="color:rgba(240,232,208,.6);font-size:.9rem;margin-bottom:14px">Ingresá el código de sala</div>
     <input id="room-inp" maxlength="4" placeholder="XXXX" style="
       font-family:'Cinzel',serif;font-size:1.6rem;letter-spacing:8px;text-align:center;
@@ -1774,58 +1851,76 @@ function guestFlow(){
       <button class="btn primary" onclick="guestConnect()" style="width:100%;padding:12px">Conectar</button>
       <button class="btn" onclick="closeLobby()" style="width:100%;font-size:.65rem;opacity:.6;padding:8px">Cancelar</button>
     </div>`;
-  setTimeout(()=>{ const i=document.getElementById('room-inp'); if(i){i.focus(); i.onkeydown=e=>{if(e.key==='Enter')guestConnect();};} },100);
+  setTimeout(() => {
+    const i = document.getElementById('room-inp');
+    if(i){ i.focus(); i.onkeydown = e => { if(e.key==='Enter') guestConnect(); }; }
+  }, 100);
 }
 
 function guestConnect(){
-  const inp=document.getElementById('room-inp');
+  const inp = document.getElementById('room-inp');
   if(!inp) return;
-  const code=inp.value.trim().toUpperCase();
-  if(code.length!==4){ toast('El código debe tener 4 letras'); return; }
+  const code = inp.value.trim().toUpperCase();
+  if(code.length !== 4){ toast('El código debe tener 4 letras'); return; }
   closeLobby();
   showWaiting('Conectando...', `Buscando sala ${code}...`);
-  document.getElementById('wait-btns').innerHTML='<button class="btn" onclick="cancelOnline()">Cancelar</button>';
+  document.getElementById('wait-btns').innerHTML = '<button class="btn" onclick="cancelOnline()">Cancelar</button>';
 
-  NET.roomCode=code; NET.isHost=false;
-  NET.peer=new Peer({debug:0});
-  NET.peer.on('open',()=>{
-    NET.hostConn=NET.peer.connect('PRES-'+code,{reliable:true});
-    NET.hostConn.on('open',()=>{
-      NET.hostConn.send({type:'NAME', name:nombres[0]});
-      document.getElementById('wait-sub').textContent='Esperando que el host inicie...';
+  NET.roomCode = code; NET.isHost = false;
+  NET.peer = new Peer({ debug:0 });
+
+  NET.peer.on('open', () => {
+    NET.hostConn = NET.peer.connect('PRES-' + code, { reliable:true });
+
+    NET.hostConn.on('open', () => {
+      // Send my display name
+      NET.hostConn.send({ type:'NAME', name: nombres[0] });
+      document.getElementById('wait-sub').textContent = 'Esperando que el host inicie...';
     });
-    NET.hostConn.on('data', data=>{
-      if(data.type==='ASSIGN'){
-        NET.myIdx=data.idx;
-        document.getElementById('wait-title').textContent=`Unido ✓ — Sos el Jugador ${data.idx+1}`;
-        document.getElementById('wait-sub').textContent='Esperando que el host inicie la partida...';
+
+    NET.hostConn.on('data', data => {
+      if(data.type === 'ASSIGN'){
+        NET.myIdx = data.idx;
+        document.getElementById('wait-title').textContent = `Unido ✓ — Sos el Jugador ${data.idx + 1}`;
+        document.getElementById('wait-sub').textContent = 'Esperando que el host inicie la partida...';
       }
-      if(data.type==='START'){
-        NET.myIdx=data.playerIdx; numJugadores=data.numJugadores;
-        Object.assign(nombres, data.names||{});
+
+      if(data.type === 'START'){
+        NET.myIdx = data.playerIdx;
+        numJugadores = data.numJugadores;
+        // Apply names so our display name shows correctly
+        Object.entries(data.names || {}).forEach(([k,v]) => { nombres[+k] = v; });
         document.getElementById('modal-waiting').classList.remove('show');
-        NET.online=true;
-        document.getElementById('online-bar').style.display='block';
-        // Guest doesn't call startGame — wait for STATE
+        NET.online = true;
+        document.getElementById('online-bar').style.display = 'block';
         setStatus('Esperando la partida...');
+        // Guest doesn't call startGame — waits for first STATE from host
       }
-      if(data.type==='STATE'){
+
+      if(data.type === 'STATE'){
         NET.applyState(data.state, NET.myIdx);
       }
     });
-    NET.hostConn.on('close',()=>{ toast('El host cerró la partida'); cancelOnline(); });
+
+    NET.hostConn.on('close', () => {
+      toast('El host cerró la partida');
+      cancelOnline();
+    });
   });
-  NET.peer.on('error',()=>{
-    document.getElementById('wait-title').textContent='No se encontró la sala';
-    document.getElementById('wait-sub').textContent='Verificá el código e intentá de nuevo';
-    document.getElementById('wait-btns').innerHTML=
+
+  NET.peer.on('error', () => {
+    document.getElementById('wait-title').textContent = 'No se encontró la sala';
+    document.getElementById('wait-sub').textContent   = 'Verificá el código e intentá de nuevo';
+    document.getElementById('wait-btns').innerHTML =
       '<button class="btn primary" onclick="guestFlow()">Reintentar</button><button class="btn" onclick="cancelOnline()">Cancelar</button>';
   });
 }
 
+// ── Patch playSelected for guests ─────────────────────────
+// (already patched above in the game logic section)
+
 // ══════════════════════════════════════════════════════════
-startGame();
-</script>
+startGame();</script>
 <!-- ONLINE: Lobby -->
 <div class="overlay" id="modal-lobby">
   <div class="modal-box" style="padding:36px 44px;max-width:460px;">
