@@ -950,7 +950,10 @@ function renderBots(){
     const nameEl=document.getElementById(`name-${i}`);
     const cntEl=document.getElementById(`cnt-${i}`);
     if(!handEl) continue;
-    const cnt=j.mano.length;
+    // On guest clients, opponent hands have mano=[] but _handCount set
+    const cnt = (NET.online && !NET.isHost && j._handCount !== undefined)
+      ? j._handCount
+      : j.mano.length;
 
     // Card backs
     handEl.innerHTML='';
@@ -977,12 +980,16 @@ function renderBots(){
 }
 
 function renderPlayerHand(){
-  const j=jugadores[0];
+  // For online guests, render the correct player's hand (not always index 0)
+  const myIdx = (NET.online && !NET.isHost) ? NET.myIdx : 0;
+  const j = jugadores[myIdx];
+  if(!j) return;
   const handEl=document.getElementById('player-hand');
   const lblEl=document.getElementById('player-label');
   const rkEl=document.getElementById('player-rank-above');
   const cntEl=document.getElementById('player-card-count');
-  const myTurn=jugadores[turnoIdx].esHumano&&!gameOver&&!j.terminado&&!j.pasado;
+  const myTurn=jugadores[turnoIdx] && jugadores[turnoIdx].esHumano&&!gameOver&&!j.terminado&&!j.pasado
+    && (NET.online ? turnoIdx===myIdx : true);
 
   const rol=j.posicion??j.rolPrev;
   if(rol){
@@ -1000,6 +1007,7 @@ function renderPlayerHand(){
 
   handEl.innerHTML='';
   j.mano.forEach((carta,idx)=>{
+    if(!carta || !carta.value || carta.value==='?') return; // skip dummy cards
     const div=document.createElement('div');
     div.className='card'+(selected.includes(idx)?' selected':'')+(myTurn?'':' disabled');
     renderCardInner(div,carta);
@@ -1035,22 +1043,27 @@ function renderCardInner(div,carta){
 }
 
 function updateControls(){
-  const myTurn=jugadores[turnoIdx]?.esHumano&&!gameOver&&!jugadores[0].terminado&&!jugadores[0].pasado;
-  document.getElementById('btn-play').disabled=!myTurn||selected.length===0;
-  document.getElementById('btn-pass').disabled=!myTurn||mesaCartas.length===0;
+  const myIdx=(NET.online&&!NET.isHost)?NET.myIdx:0;
+  const me=jugadores[myIdx];
+  const isMyTurn=!gameOver && me && !me.terminado && !me.pasado
+    && (NET.online ? turnoIdx===myIdx : jugadores[turnoIdx]?.esHumano);
+  document.getElementById('btn-play').disabled=!isMyTurn||selected.length===0;
+  document.getElementById('btn-pass').disabled=!isMyTurn||mesaCartas.length===0;
 }
 
 // ══════════════════════════════════════════════════════════
 //  SELECCIÓN
 // ══════════════════════════════════════════════════════════
 function toggleSelect(idx){
-  if(!jugadores[turnoIdx].esHumano||jugadores[0].terminado) return;
-  const carta=jugadores[0].mano[idx];
+  const myIdx=(NET.online&&!NET.isHost)?NET.myIdx:0;
+  if(turnoIdx!==myIdx||jugadores[myIdx]?.terminado) return;
+  const carta=jugadores[myIdx].mano[idx];
   if(selected.includes(idx)){ selected=selected.filter(i=>i!==idx); }
   else {
     if(selected.length>0){
-      const baseIdx=selected.find(i=>!jugadores[0].mano[i].esComodin);
-      const base=baseIdx!==undefined?jugadores[0].mano[baseIdx]:null;
+      const hand=jugadores[myIdx].mano;
+      const baseIdx=selected.find(i=>!hand[i].esComodin);
+      const base=baseIdx!==undefined?hand[baseIdx]:null;
       if(base&&!carta.esComodin&&carta.value!==base.value){ toast('Solo podés seleccionar cartas del mismo valor'); return; }
     }
     selected.push(idx);
@@ -1226,6 +1239,13 @@ function advanceTurn(){
 
 function doBotTurn(){
   if(gameOver) return;
+  // ONLINE HOST: if it's a guest's turn, wait for their network action
+  if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
+    renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
+    setStatus(`Esperando a ${jugadores[turnoIdx].nombre}...`);
+    NET.broadcast();
+    return;
+  }
   const j=jugadores[turnoIdx];
   // If this player is terminated or already passed, skip to next active
   if(j.terminado||j.pasado){
@@ -1490,6 +1510,8 @@ function openSettings(){
   buildRankEditor();
   document.getElementById('modal-settings').classList.add('show');
 }
+function closeSettings(){ document.getElementById('modal-settings').classList.remove('show'); }
+
 // ══════════════════════════════════════════════════════════
 //  MULTIPLAYER — NET (rewritten)
 // ══════════════════════════════════════════════════════════
@@ -1577,7 +1599,7 @@ NET.applyState = function(state, myIdx){
     });
   }
 
-  // Restore hands — full hand only for my own index, count only for others
+  // Restore hands — full hand only for my own index
   state.jugadores.forEach((jd, i) => {
     if(i === myIdx){
       jugadores[i].mano = jd.mano.map(cd => {
@@ -1585,8 +1607,9 @@ NET.applyState = function(state, myIdx){
         c.jokerVal = cd.jokerVal; return c;
       });
     } else {
-      // Keep a dummy array of the right length so card-count renders correctly
-      jugadores[i].mano = Array(jd.mano.length).fill(null).map(() => new Carta('?',''));
+      // Store count for card-back rendering, but no actual card data
+      jugadores[i].mano = [];
+      jugadores[i]._handCount = jd.mano.length;
     }
   });
 
@@ -1661,21 +1684,6 @@ NET.handleGuestAction = function(guestIdx, action){
     }
   }
 };
-
-// ── Patch advanceTurn: host waits for guest instead of running bot ──
-// We patch doBotTurn to skip online guest slots
-const _origDoBotTurn = doBotTurn;
-function doBotTurn(){
-  if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
-    // This is a guest's turn — host waits for their network action
-    // Just re-render so the UI shows whose turn it is
-    renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
-    setStatus(`Esperando a ${jugadores[turnoIdx].nombre}...`);
-    NET.broadcast(); // make sure guest sees it's their turn
-    return;
-  }
-  _origDoBotTurn();
-}
 
 // ── Joker picker for guests ───────────────────────────────
 function openJokerForNet(cartas){
