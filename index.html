@@ -920,40 +920,48 @@ function renderBelowTable(){
 
 function renderBots(){
   const botsArea=document.getElementById('bots-area');
-  const maxBots=4; // support up to 5 players (1 human + 4 bots)
+  const myIdx=(NET.online&&!NET.isHost)?NET.myIdx:0;
+  const maxBots=4;
 
-  // Build DOM for any bot zones that don't exist yet
-  for(let i=1;i<=maxBots;i++){
-    if(!document.getElementById(`zone-${i}`)){
-      const zone=document.createElement('div'); zone.className='bot-zone'; zone.id=`zone-${i}`;
+  // Build DOM slots 1..maxBots
+  for(let slot=1;slot<=maxBots;slot++){
+    if(!document.getElementById(`zone-${slot}`)){
+      const zone=document.createElement('div'); zone.className='bot-zone'; zone.id=`zone-${slot}`;
       zone.innerHTML=`
-        <div class="rank-above empty" id="rank-${i}"></div>
-        <div class="bot-label" id="label-${i}" onclick="startEditName(${i})">
-          <span id="name-${i}">${nombres[i]||'BOT '+i}</span><span class="bot-card-count" id="cnt-${i}"></span>
+        <div class="rank-above empty" id="rank-${slot}"></div>
+        <div class="bot-label" id="label-${slot}" onclick="startEditName(${slot})">
+          <span id="name-${slot}"></span><span class="bot-card-count" id="cnt-${slot}"></span>
         </div>
-        <div class="bot-hand" id="hand-${i}"></div>
-        <div class="bot-status" id="bstatus-${i}"></div>`;
+        <div class="bot-hand" id="hand-${slot}"></div>
+        <div class="bot-status" id="bstatus-${slot}"></div>`;
       botsArea.appendChild(zone);
     }
-    // Show/hide based on current player count
-    const zone=document.getElementById(`zone-${i}`);
-    if(zone) zone.style.display=(i<jugadores.length)?'flex':'none';
   }
 
-  // Update each visible bot
-  for(let i=1;i<jugadores.length;i++){
-    const j=jugadores[i];
-    const handEl=document.getElementById(`hand-${i}`);
-    const lblEl=document.getElementById(`label-${i}`);
-    const stEl=document.getElementById(`bstatus-${i}`);
-    const rkEl=document.getElementById(`rank-${i}`);
-    const nameEl=document.getElementById(`name-${i}`);
-    const cntEl=document.getElementById(`cnt-${i}`);
-    if(!handEl) continue;
-    // On guest clients, opponent hands have mano=[] but _handCount set
-    const cnt = (NET.online && !NET.isHost && j._handCount !== undefined)
-      ? j._handCount
-      : j.mano.length;
+  // Build list of opponent indices (all players except myIdx)
+  const opponents = jugadores.map((_,i)=>i).filter(i=>i!==myIdx);
+
+  // Show/hide slots
+  for(let slot=1;slot<=maxBots;slot++){
+    const zone=document.getElementById(`zone-${slot}`);
+    if(zone) zone.style.display=(slot<=opponents.length)?'flex':'none';
+  }
+
+  // Map slot → jugador index and render
+  opponents.forEach((jIdx, slotIdx)=>{
+    const slot=slotIdx+1;
+    const j=jugadores[jIdx];
+    const handEl=document.getElementById(`hand-${slot}`);
+    const lblEl=document.getElementById(`label-${slot}`);
+    const stEl=document.getElementById(`bstatus-${slot}`);
+    const rkEl=document.getElementById(`rank-${slot}`);
+    const nameEl=document.getElementById(`name-${slot}`);
+    const cntEl=document.getElementById(`cnt-${slot}`);
+    if(!handEl||!j) return;
+
+    // Card count: guests see _handCount for opponents
+    const cnt=(NET.online&&!NET.isHost&&j._handCount!==undefined)
+      ? j._handCount : j.mano.length;
 
     // Card backs
     handEl.innerHTML='';
@@ -962,21 +970,20 @@ function renderBots(){
 
     // Rank above
     const rol=j.posicion??j.rolPrev;
-    if(rol){
-      rkEl.textContent=posLabel(rol);
-      rkEl.className='rank-above '+posClass(rol);
-    } else { rkEl.textContent=''; rkEl.className='rank-above empty'; }
+    if(rol){ rkEl.textContent=posLabel(rol); rkEl.className='rank-above '+posClass(rol); }
+    else    { rkEl.textContent=''; rkEl.className='rank-above empty'; }
 
-    // Name + count (only update name if not editing)
-    if(!nameEl.querySelector('input') && nameEl.tagName!=='INPUT'){
-      nameEl.textContent=j.nombre;
-    }
-    cntEl.textContent=j.terminado?'':` (${cnt})`;
+    // Name + count
+    if(nameEl&&!nameEl.querySelector('input')) nameEl.textContent=j.nombre;
+    if(cntEl) cntEl.textContent=j.terminado?'':` (${cnt})`;
 
-    // Label classes
-    lblEl.className='bot-label'+(j.terminado?' eliminated':(turnoIdx===i&&!gameOver?' active-turn':''));
+    // Label — active turn highlight
+    lblEl.className='bot-label'+(j.terminado?' eliminated':(turnoIdx===jIdx&&!gameOver?' active-turn':''));
+
+    // Allow name edit only for local single-player (not guests)
+    lblEl.onclick = (!NET.online || NET.isHost) ? ()=>startEditName(jIdx) : null;
     stEl.textContent='';
-  }
+  });
 }
 
 function renderPlayerHand(){
