@@ -750,11 +750,15 @@ function startGame(withExchange=false){
 }
 
 function beginPlay(){
-  // Always re-find who holds the 2♦ after any card exchanges
   const nuevo2D=jugadores.findIndex(j=>j.mano.some(c=>c.value==='2'&&c.suit==='♦'));
   turnoIdx=(nuevo2D!==-1)?nuevo2D:0;
   renderAll();
-  if(jugadores[turnoIdx].esHumano){
+
+  if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
+    // Guest holds 2♦ — broadcast and wait for their action
+    setStatus(`Esperando a ${jugadores[turnoIdx].nombre}...`);
+    NET.broadcast();
+  } else if(jugadores[turnoIdx].esHumano){
     setStatus('Tu turno — jugá el 2♦ para empezar'); updateControls();
   } else {
     setStatus(`${jugadores[turnoIdx].nombre} arranca`); setTimeout(doBotTurn, botSpeed);
@@ -1218,7 +1222,6 @@ function advanceTurn(){
   const sinPasar=jugadores.filter(j=>!j.terminado&&!j.pasado);
 
   if(mesaCartas.length>0&&sinPasar.length===0){
-    // Everyone passed — the last player who played wins
     const ganador=jugadores[ultimoEnJugar];
     showAboveMsg(`${ganador.nombre} gana la ronda`);
     setTimeout(()=>startNewRound(ganador.id),1000);
@@ -1226,7 +1229,6 @@ function advanceTurn(){
   }
 
   if(mesaCartas.length>0&&sinPasar.length===1&&sinPasar[0].id===ultimoEnJugar){
-    // Only the player who last played remains — they win (everyone else passed)
     const ganador=sinPasar[0];
     showAboveMsg(`${ganador.nombre} gana la ronda`);
     setTimeout(()=>startNewRound(ganador.id),1000);
@@ -1238,6 +1240,14 @@ function advanceTurn(){
     turnoIdx=nextActive(turnoIdx);
   }
 
+  // ONLINE HOST: if it's a guest's turn, broadcast and wait — don't run bot or show "Tu turno"
+  if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
+    setStatus(`Esperando a ${jugadores[turnoIdx].nombre}...`);
+    renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
+    NET.broadcast();
+    return;
+  }
+
   // A: only re-render bots/player/below — NOT the table (avoids card flicker on pass)
   renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
   if(jugadores[turnoIdx].esHumano){ setStatus('Tu turno'); updateControls(); }
@@ -1246,20 +1256,9 @@ function advanceTurn(){
 
 function doBotTurn(){
   if(gameOver) return;
-  // ONLINE HOST: if it's a guest's turn, wait for their network action
-  if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
-    renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
-    setStatus(`Esperando a ${jugadores[turnoIdx].nombre}...`);
-    NET.broadcast();
-    return;
-  }
+  if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)) return; // advanceTurn handles this
   const j=jugadores[turnoIdx];
-  // If this player is terminated or already passed, skip to next active
-  if(j.terminado||j.pasado){
-    turnoIdx=nextActive(turnoIdx);
-    advanceTurn();
-    return;
-  }
+  if(j.terminado||j.pasado){ turnoIdx=nextActive(turnoIdx); advanceTurn(); return; }
   if(j.esHumano){ advanceTurn(); return; }
   const mesaRef=mesaCartas.length>0?mesaCartas[0]:null;
   const jugada=j.elegirJugada(mesaRef,mesaCantidad||1);
@@ -1633,6 +1632,18 @@ NET.applyState = function(state, myIdx){
   if(state.statusMsg) setStatus(state.statusMsg);
   if(state.aboveMsg)  showAboveMsg(state.aboveMsg);
 
+  // Override status message from host with guest-appropriate message
+  if(!state.gameOver){
+    if(state.turnoIdx === myIdx){
+      setStatus('Tu turno');
+    } else {
+      const turnPlayer = jugadores[state.turnoIdx];
+      setStatus(turnPlayer ? `Turno de ${turnPlayer.nombre}` : '');
+    }
+  } else {
+    if(state.statusMsg) setStatus(state.statusMsg);
+  }
+
   // Exchange: show modal only if it's this guest's turn to give
   if(state.exchangePending && state.exchangePending.giverIdx === myIdx){
     if(!exchangePending){
@@ -1839,16 +1850,8 @@ function hostBegin(){
   document.getElementById('modal-waiting').classList.remove('show');
   NET.online = true;
   document.getElementById('online-bar').style.display = 'block';
-
   rolesAnteriores = {}; dealStartId = -1;
-
-  // Start game — mark guest slots as "human" so bots don't run for them
-  // We do this by temporarily overriding how startGame builds jugadores
-  NET._guestIndices = guestList.map(g => g.idx);
   startGame();
-  // After startGame, mark guest players as esHumano=true on host
-  NET._guestIndices.forEach(i => { if(jugadores[i]) jugadores[i].esHumano = true; });
-  NET._guestIndices = [];
 }
 
 // ── GUEST ─────────────────────────────────────────────────
