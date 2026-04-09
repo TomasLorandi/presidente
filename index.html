@@ -999,8 +999,14 @@ function renderPlayerHand(){
   const lblEl=document.getElementById('player-label');
   const rkEl=document.getElementById('player-rank-above');
   const cntEl=document.getElementById('player-card-count');
-  const myTurn=jugadores[turnoIdx] && jugadores[turnoIdx].esHumano&&!gameOver&&!j.terminado&&!j.pasado
-    && (NET.online ? turnoIdx===myIdx : true);
+
+  // myTurn: for guests check turnoIdx===myIdx directly, for local check esHumano
+  let myTurn;
+  if(NET.online && !NET.isHost){
+    myTurn = turnoIdx===myIdx && !gameOver && !j.terminado && !j.pasado;
+  } else {
+    myTurn = jugadores[turnoIdx]?.esHumano && !gameOver && !j.terminado && !j.pasado;
+  }
 
   const rol=j.posicion??j.rolPrev;
   if(rol){
@@ -1056,8 +1062,12 @@ function renderCardInner(div,carta){
 function updateControls(){
   const myIdx=(NET.online&&!NET.isHost)?NET.myIdx:0;
   const me=jugadores[myIdx];
-  const isMyTurn=!gameOver && me && !me.terminado && !me.pasado
-    && (NET.online ? turnoIdx===myIdx : jugadores[turnoIdx]?.esHumano);
+  let isMyTurn;
+  if(NET.online && !NET.isHost){
+    isMyTurn = !gameOver && !!me && !me.terminado && !me.pasado && turnoIdx===myIdx;
+  } else {
+    isMyTurn = !gameOver && !!me && !me.terminado && !me.pasado && !!jugadores[turnoIdx]?.esHumano;
+  }
   document.getElementById('btn-play').disabled=!isMyTurn||selected.length===0;
   document.getElementById('btn-pass').disabled=!isMyTurn||mesaCartas.length===0;
 }
@@ -1067,7 +1077,11 @@ function updateControls(){
 // ══════════════════════════════════════════════════════════
 function toggleSelect(idx){
   const myIdx=(NET.online&&!NET.isHost)?NET.myIdx:0;
-  if(turnoIdx!==myIdx||jugadores[myIdx]?.terminado) return;
+  // Allow selection only when it's this player's turn
+  const canSelect = NET.online && !NET.isHost
+    ? turnoIdx===myIdx
+    : jugadores[turnoIdx]?.esHumano;
+  if(!canSelect || jugadores[myIdx]?.terminado) return;
   const carta=jugadores[myIdx].mano[idx];
   if(selected.includes(idx)){ selected=selected.filter(i=>i!==idx); }
   else {
