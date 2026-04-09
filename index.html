@@ -1676,6 +1676,7 @@ NET.applyState = function(state, myIdx){
 
   // Re-render everything from guest's perspective
   renderBots(); renderPlayerHand(); renderTable(); renderBelowTable(); updateControls();
+  updateDebug();
 
   // Game over
   if(state.gameOver && !finishOrder.length){
@@ -1951,6 +1952,28 @@ function guestConnect(){
 // ── Patch playSelected for guests ─────────────────────────
 // (already patched above in the game logic section)
 
+function updateDebug(){
+  if(!NET.online || NET.isHost) return;
+  const el=document.getElementById('net-debug');
+  if(!el) return;
+  el.style.display='block';
+  const me=jugadores[NET.myIdx];
+  const myTurn=turnoIdx===NET.myIdx;
+  el.innerHTML=[
+    `myIdx: ${NET.myIdx}`,
+    `turnoIdx: ${turnoIdx}`,
+    `myTurn: ${myTurn}`,
+    `me.pasado: ${me?.pasado}`,
+    `me.terminado: ${me?.terminado}`,
+    `me.mano: ${me?.mano?.length} cartas`,
+    `NET.online: ${NET.online}`,
+    `NET.isHost: ${NET.isHost}`,
+    `selected: [${selected}]`,
+    `gameOver: ${gameOver}`,
+    `jugadores: ${jugadores.length}`
+  ].join('<br>');
+}
+
 // ══════════════════════════════════════════════════════════
 startGame();</script>
 <!-- ONLINE: Lobby -->
@@ -1971,5 +1994,10 @@ startGame();</script>
 </div>
 <!-- ONLINE: Top bar indicator -->
 <div id="online-bar" style="display:none;position:fixed;top:0;left:0;right:0;height:3px;background:var(--gold);z-index:200;opacity:.7;"></div>
+<!-- Debug overlay - shows for guests -->
+<div id="net-debug" style="display:none;position:fixed;bottom:60px;left:10px;
+  background:rgba(0,0,0,.85);color:#0f0;font-family:monospace;font-size:11px;
+  padding:8px;border-radius:4px;z-index:999;max-width:300px;line-height:1.6;
+  border:1px solid #0f0;"></div>
 </body>
 </html>
