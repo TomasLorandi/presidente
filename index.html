@@ -1106,6 +1106,13 @@ function playSelected(){
     if(NET.myIdx!==turnoIdx) return;
     const j=jugadores[NET.myIdx];
     const cartas=selected.map(i=>j.mano[i]);
+    // Client-side pre-validation
+    if(mesaCartas.length>0 && cartas.length!==mesaCantidad){
+      toast(`Debés jugar exactamente ${mesaCantidad} carta${mesaCantidad>1?'s':''}`); return;
+    }
+    if(primeraRonda && mesaCartas.length===0 && !cartas.some(c=>c.value==='2'&&c.suit==='♦')){
+      toast('Debés jugar el 2♦ para arrancar'); return;
+    }
     const hasJoker=cartas.some(c=>c.esComodin);
     if(hasJoker){
       const normales=cartas.filter(c=>!c.esComodin);
@@ -1693,11 +1700,30 @@ NET.applyState = function(state, myIdx){
 NET.handleGuestAction = function(guestIdx, action){
   if(turnoIdx !== guestIdx) return; // not their turn, ignore
   const j = jugadores[guestIdx];
+  const conn = Object.values(this.guests).find(g => g.idx === guestIdx)?.conn;
+
+  const sendErr = (msg) => {
+    if(conn && conn.open) conn.send({type:'TOAST', msg});
+  };
 
   if(action.type === 'PLAY'){
     const cartas = action.indices.map(i => j.mano[i]);
+    if(cartas.some(c => !c)){ sendErr('Error: carta no encontrada'); return; }
     if(action.jokerVal) cartas.filter(c => c.esComodin).forEach(c => { c.jokerVal = action.jokerVal; });
-    if(!validatePlay(cartas)) return;
+    // Validate: check quantity matches mesaCantidad
+    if(mesaCartas.length > 0 && cartas.length !== mesaCantidad){
+      sendErr(`Debés jugar exactamente ${mesaCantidad} carta${mesaCantidad>1?'s':''}`); return;
+    }
+    // Validate: check it beats the table
+    if(mesaCartas.length > 0){
+      const ref = mesaCartas[0];
+      const beats = cartas.some(c=>c.isAce()||(c.esComodin&&c.jokerVal==='A'))||cartas[0].beats(ref);
+      if(!beats){ sendErr('Esa jugada no supera la de la mesa'); return; }
+    }
+    // First play: must include 2♦
+    if(primeraRonda && mesaCartas.length === 0){
+      if(!cartas.some(c=>c.value==='2'&&c.suit==='♦')){ sendErr('Debés jugar el 2♦ para arrancar'); return; }
+    }
     doPlay(j, cartas);
   }
 
@@ -1937,6 +1963,10 @@ function guestConnect(){
       if(data.type === 'STATE'){
         NET.applyState(data.state, NET.myIdx);
       }
+
+      if(data.type === 'TOAST'){
+        toast(data.msg);
+      }
     });
 
     NET.hostConn.on('close', () => {
@@ -1970,9 +2000,10 @@ function updateDebug(){
     `me.pasado: ${me?.pasado}`,
     `me.terminado: ${me?.terminado}`,
     `me.mano: ${me?.mano?.length} cartas`,
+    `mesaCantidad: ${mesaCantidad}`,
+    `selected(${selected.length}): [${selected}]`,
     `NET.online: ${NET.online}`,
     `NET.isHost: ${NET.isHost}`,
-    `selected: [${selected}]`,
     `gameOver: ${gameOver}`,
     `jugadores: ${jugadores.length}`
   ].join('<br>');
