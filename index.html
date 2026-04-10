@@ -1567,6 +1567,10 @@ NET.sendToHost = function(msg){
   if(this.hostConn && this.hostConn.open) this.hostConn.send(msg);
 };
 
+NET.sendAction = function(action){
+  this.sendToHost({ type:'ACTION', action });
+};
+
 NET.broadcast = function(){
   if(!this.online || !this.isHost) return;
   const base = this.buildState();
