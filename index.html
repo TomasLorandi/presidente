@@ -409,6 +409,12 @@
       </div>
     </div>
     <div class="settings-section">
+      <div class="settings-label">MODO DEBUG</div>
+      <div style="margin-top:4px">
+        <button id="btn-debug" onclick="toggleDebug()" class="compact-toggle">OFF</button>
+      </div>
+    </div>
+    <div class="settings-section">
       <div class="settings-label">COLOR TAPETE</div>
       <div class="swatch-row" id="swatches-felt"></div>
     </div>
@@ -711,6 +717,16 @@ function hardNewGame(){
 // Soft start: usa roles para intercambiar cartas, luego juega
 function startNextGame(){
   document.getElementById('modal-results').classList.remove('show');
+  if(NET.online && !NET.isHost){
+    // Guest just waits — host will broadcast new game state
+    setStatus('Esperando nueva partida...');
+    return;
+  }
+  if(NET.online && NET.isHost){
+    // Host restarts and broadcasts
+    startGame(true);
+    return;
+  }
   startGame(true);
 }
 
@@ -899,6 +915,7 @@ function confirmExchange(){
 function renderAll(){
   renderBots(); renderPlayerHand(); renderTable(); renderBelowTable(); updateControls();
   if(NET.online && NET.isHost) NET.broadcast();
+  updateDebug();
 }
 
 function renderBelowTable(){
@@ -1121,14 +1138,20 @@ function playSelected(){
         const mesaOrd=mesaCartas.length>0?mesaCartas[0].effOrder():-1;
         if(VORDER[valBase]>mesaOrd||mesaCartas.length===0){
           NET.sendAction({type:'PLAY',indices:[...selected],jokerVal:valBase});
-          selected=[]; return;
+          selected=[];
+          setStatus('Jugando — esperando...');
+          updateControls();
+          return;
         }
       }
       NET.pendingIdx=[...selected];
       openJokerForNet(cartas); return;
     }
     NET.sendAction({type:'PLAY',indices:[...selected]});
-    selected=[]; return;
+    selected=[];
+    setStatus('Jugando — esperando...');
+    updateControls();
+    return;
   }
   // LOCAL / HOST path
   const j=jugadores[0];
@@ -1232,7 +1255,13 @@ function doPlay(jugador,cartas){
 function passTurn(){
   if(NET.online && !NET.isHost){
     if(NET.myIdx!==turnoIdx) return;
-    NET.sendAction({type:'PASS'}); selected=[]; return;
+    NET.sendAction({type:'PASS'}); selected=[];
+    // Optimistically update local UI while waiting for host broadcast
+    const me=jugadores[NET.myIdx];
+    if(me) me.pasado=true;
+    setStatus('Pasaste — esperando...');
+    updateControls();
+    return;
   }
   const j=jugadores[0]; j.pasado=true; selected=[]; turnoIdx=nextActive(j.id);
   setStatus('Pasaste'); advanceTurn();
@@ -1375,6 +1404,14 @@ const FACE_THEMES = [
 // Current selections — defaults: Felt=Verde(0), Text=Dorado(5), Back=Azul(2), Face=Blanco(6)
 let curFelt=0, curText=5, curBack=2, curFace=6;
 let compactMode = false;
+let debugMode   = false;
+
+function toggleDebug(){
+  debugMode = !debugMode;
+  const btn=document.getElementById('btn-debug');
+  if(btn){ btn.textContent=debugMode?'ON':'OFF'; btn.classList.toggle('on',debugMode); }
+  updateDebug();
+}
 let botSpeed = 1200; // ms between bot actions
 
 function setBotSpeed(ms){
@@ -1534,6 +1571,9 @@ function openSettings(){
   // Sync compact button
   const btn=document.getElementById('btn-compact');
   if(btn){ btn.textContent=compactMode?'ON':'OFF'; btn.classList.toggle('on',compactMode); }
+  // Sync debug button
+  const dbtn=document.getElementById('btn-debug');
+  if(dbtn){ dbtn.textContent=debugMode?'ON':'OFF'; dbtn.classList.toggle('on',debugMode); }
   buildRankEditor();
   document.getElementById('modal-settings').classList.add('show');
 }
@@ -1987,23 +2027,23 @@ function guestConnect(){
 // (already patched above in the game logic section)
 
 function updateDebug(){
-  if(!NET.online || NET.isHost) return;
   const el=document.getElementById('net-debug');
   if(!el) return;
+  if(!debugMode){ el.style.display='none'; return; }
   el.style.display='block';
-  const me=jugadores[NET.myIdx];
-  const myTurn=turnoIdx===NET.myIdx;
+  const myIdx=NET.online&&!NET.isHost?NET.myIdx:0;
+  const me=jugadores[myIdx];
+  const myTurn=NET.online&&!NET.isHost ? turnoIdx===myIdx : jugadores[turnoIdx]?.esHumano;
   el.innerHTML=[
-    `myIdx: ${NET.myIdx}`,
+    `mode: ${NET.online?(NET.isHost?'HOST':'GUEST'):'LOCAL'}`,
+    `myIdx: ${myIdx}`,
     `turnoIdx: ${turnoIdx}`,
     `myTurn: ${myTurn}`,
     `me.pasado: ${me?.pasado}`,
     `me.terminado: ${me?.terminado}`,
-    `me.mano: ${me?.mano?.length} cartas`,
+    `me.mano: ${me?.mano?.length??'?'} cartas`,
     `mesaCantidad: ${mesaCantidad}`,
     `selected(${selected.length}): [${selected}]`,
-    `NET.online: ${NET.online}`,
-    `NET.isHost: ${NET.isHost}`,
     `gameOver: ${gameOver}`,
     `jugadores: ${jugadores.length}`
   ].join('<br>');
@@ -2029,10 +2069,10 @@ startGame();</script>
 </div>
 <!-- ONLINE: Top bar indicator -->
 <div id="online-bar" style="display:none;position:fixed;top:0;left:0;right:0;height:3px;background:var(--gold);z-index:200;opacity:.7;"></div>
-<!-- Debug overlay - shows for guests -->
-<div id="net-debug" style="display:none;position:fixed;bottom:60px;left:10px;
+<!-- Debug overlay - controlled by settings toggle -->
+<div id="net-debug" style="display:none;position:fixed;top:50%;left:10px;transform:translateY(-50%);
   background:rgba(0,0,0,.85);color:#0f0;font-family:monospace;font-size:11px;
-  padding:8px;border-radius:4px;z-index:999;max-width:300px;line-height:1.6;
-  border:1px solid #0f0;"></div>
+  padding:8px;border-radius:4px;z-index:999;max-width:220px;line-height:1.6;
+  border:1px solid #0f0;pointer-events:none;"></div>
 </body>
 </html>
