@@ -771,8 +771,7 @@ function beginPlay(){
   renderAll();
 
   if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
-    // Guest holds 2♦ — broadcast and wait for their action
-    setStatus(`Esperando a ${jugadores[turnoIdx].nombre}...`);
+    setStatus(`${jugadores[turnoIdx].nombre} arranca`);
     NET.broadcast();
   } else if(jugadores[turnoIdx].esHumano){
     setStatus('Tu turno — jugá el 2♦ para empezar'); updateControls();
@@ -1140,7 +1139,8 @@ function playSelected(){
           NET.sendAction({type:'PLAY',indices:[...selected],jokerVal:valBase});
           selected=[];
           setStatus('Jugando — esperando...');
-          updateControls();
+          document.getElementById('btn-play').disabled=true;
+          document.getElementById('btn-pass').disabled=true;
           return;
         }
       }
@@ -1150,7 +1150,8 @@ function playSelected(){
     NET.sendAction({type:'PLAY',indices:[...selected]});
     selected=[];
     setStatus('Jugando — esperando...');
-    updateControls();
+    document.getElementById('btn-play').disabled=true;
+    document.getElementById('btn-pass').disabled=true;
     return;
   }
   // LOCAL / HOST path
@@ -1256,11 +1257,10 @@ function passTurn(){
   if(NET.online && !NET.isHost){
     if(NET.myIdx!==turnoIdx) return;
     NET.sendAction({type:'PASS'}); selected=[];
-    // Optimistically update local UI while waiting for host broadcast
-    const me=jugadores[NET.myIdx];
-    if(me) me.pasado=true;
     setStatus('Pasaste — esperando...');
-    updateControls();
+    // Disable buttons immediately by temporarily shifting turnoIdx locally
+    document.getElementById('btn-play').disabled=true;
+    document.getElementById('btn-pass').disabled=true;
     return;
   }
   const j=jugadores[0]; j.pasado=true; selected=[]; turnoIdx=nextActive(j.id);
@@ -1292,7 +1292,7 @@ function advanceTurn(){
 
   // ONLINE HOST: if it's a guest's turn, broadcast and wait — don't run bot or show "Tu turno"
   if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
-    setStatus(`Esperando a ${jugadores[turnoIdx].nombre}...`);
+    setStatus(`${jugadores[turnoIdx].nombre} arranca`);
     renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
     NET.broadcast();
     return;
@@ -1351,6 +1351,11 @@ function showResults(){
 // ══════════════════════════════════════════════════════════
 // "Nueva Partida" button: resets roles, asks confirmation
 function confirmNewGame(){
+  // Online guest: can't start new game, only host can
+  if(NET.online && !NET.isHost){
+    toast('Solo el host puede iniciar una nueva partida');
+    return;
+  }
   if(gameOver){ hardNewGame(); return; }
   document.getElementById('modal-confirm').classList.add('show');
 }
@@ -1644,7 +1649,8 @@ NET.buildState = function(){
       ? { giverIdx: exchangePending.giver.id, receiverIdx: exchangePending.receiver.id, count: exchangePending.count }
       : null,
     statusMsg:   document.getElementById('status-msg').textContent,
-    aboveMsg:    document.getElementById('above-table-msg').textContent
+    aboveMsg:    document.getElementById('above-table-msg').textContent,
+    rolesAnteriores: rolesAnteriores
   };
 };
 
@@ -1693,6 +1699,7 @@ NET.applyState = function(state, myIdx){
   numRonda      = state.numRonda || 0;
   gameOver      = state.gameOver || false;
   primeraRonda  = state.primeraRonda !== undefined ? state.primeraRonda : true;
+  if(state.rolesAnteriores) rolesAnteriores = state.rolesAnteriores;
 
   if(state.statusMsg) setStatus(state.statusMsg);
   if(state.aboveMsg)  showAboveMsg(state.aboveMsg);
