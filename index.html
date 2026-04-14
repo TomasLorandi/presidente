@@ -771,12 +771,12 @@ function beginPlay(){
   renderAll();
 
   if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
-    setStatus(`${jugadores[turnoIdx].nombre} arranca`);
+    setStatus(`Turno de ${jugadores[turnoIdx].nombre}`);
     NET.broadcast();
   } else if(jugadores[turnoIdx].esHumano){
     setStatus('Tu turno — jugá el 2♦ para empezar'); updateControls();
   } else {
-    setStatus(`${jugadores[turnoIdx].nombre} arranca`); setTimeout(doBotTurn, botSpeed);
+    setStatus(`Turno de ${jugadores[turnoIdx].nombre}`); setTimeout(doBotTurn, botSpeed);
   }
 }
 
@@ -844,8 +844,12 @@ function processExchangeQueue(){
   const ex=exchangeQueue.shift();
   exchangePending={...ex, selected:[]};
 
-  if(ex.giver.esHumano){
+  const giverIsHuman = ex.giver.esHumano || (NET.online && NET.isHost && NET.isGuestSlot(ex.giver.id));
+
+  if(giverIsHuman){
     openExchangeModal(ex.giver,ex.receiver,ex.count);
+    // For online: broadcast so the guest sees the exchange modal
+    if(NET.online && NET.isHost) NET.broadcast();
   } else {
     // Bot logic: give worst cards
     const toGive=ex.giver.worstCards(ex.count);
@@ -913,8 +917,8 @@ function confirmExchange(){
 // ══════════════════════════════════════════════════════════
 function renderAll(){
   renderBots(); renderPlayerHand(); renderTable(); renderBelowTable(); updateControls();
-  if(NET.online && NET.isHost) NET.broadcast();
   updateDebug();
+  // Broadcast happens explicitly in advanceTurn/startNewRound/beginPlay, not here
 }
 
 function renderBelowTable(){
@@ -1122,12 +1126,9 @@ function playSelected(){
     if(NET.myIdx!==turnoIdx) return;
     const j=jugadores[NET.myIdx];
     const cartas=selected.map(i=>j.mano[i]);
-    // Client-side pre-validation
+    // Client-side pre-validation: only check quantity
     if(mesaCartas.length>0 && cartas.length!==mesaCantidad){
       toast(`Debés jugar exactamente ${mesaCantidad} carta${mesaCantidad>1?'s':''}`); return;
-    }
-    if(primeraRonda && mesaCartas.length===0 && !cartas.some(c=>c.value==='2'&&c.suit==='♦')){
-      toast('Debés jugar el 2♦ para arrancar'); return;
     }
     const hasJoker=cartas.some(c=>c.esComodin);
     if(hasJoker){
@@ -1290,18 +1291,22 @@ function advanceTurn(){
     turnoIdx=nextActive(turnoIdx);
   }
 
-  // ONLINE HOST: if it's a guest's turn, broadcast and wait — don't run bot or show "Tu turno"
+  // ONLINE HOST: if it's a guest's turn, broadcast and wait
   if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
-    setStatus(`${jugadores[turnoIdx].nombre} arranca`);
+    setStatus(`Turno de ${jugadores[turnoIdx].nombre}`);
     renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
     NET.broadcast();
     return;
   }
 
-  // A: only re-render bots/player/below — NOT the table (avoids card flicker on pass)
+  // A: only re-render bots/player/below — NOT the table
   renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
-  if(jugadores[turnoIdx].esHumano){ setStatus('Tu turno'); updateControls(); }
-  else setTimeout(doBotTurn, botSpeed);
+  if(jugadores[turnoIdx].esHumano){
+    setStatus('Tu turno'); updateControls();
+  } else {
+    setStatus(`Turno de ${jugadores[turnoIdx].nombre}`);
+    setTimeout(doBotTurn, botSpeed);
+  }
 }
 
 function doBotTurn(){
@@ -1312,7 +1317,13 @@ function doBotTurn(){
   if(j.esHumano){ advanceTurn(); return; }
   const mesaRef=mesaCartas.length>0?mesaCartas[0]:null;
   const jugada=j.elegirJugada(mesaRef,mesaCantidad||1);
-  if(!jugada||jugada.length===0){ j.pasado=true; setStatus(`${j.nombre} pasó`); turnoIdx=nextActive(j.id); advanceTurn(); }
+  if(!jugada||jugada.length===0){
+    j.pasado=true;
+    setStatus(`${j.nombre} pasó`);
+    turnoIdx=nextActive(j.id);
+    if(NET.online && NET.isHost) NET.broadcast();
+    advanceTurn();
+  }
   else doPlay(j,jugada);
 }
 
@@ -1323,9 +1334,17 @@ function startNewRound(startId){
   jugadores.forEach(j=>{ if(!j.terminado) j.pasado=false; });
   turnoIdx=(!jugadores[startId]||jugadores[startId].terminado)?nextActive(startId):startId;
   renderAll();
-  // J: just show "nombre arranca"
-  setStatus(`${jugadores[turnoIdx].nombre} arranca`);
-  advanceTurn();
+  if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
+    setStatus(`Turno de ${jugadores[turnoIdx].nombre}`);
+    NET.broadcast();
+  } else if(jugadores[turnoIdx].esHumano){
+    setStatus('Tu turno'); updateControls();
+    if(NET.online && NET.isHost) NET.broadcast(); // guests need to know it's host's turn
+  } else {
+    setStatus(`Turno de ${jugadores[turnoIdx].nombre}`);
+    if(NET.online && NET.isHost) NET.broadcast(); // guests see bot turn
+    setTimeout(doBotTurn, botSpeed);
+  }
 }
 
 function checkGameOver(){
@@ -1334,7 +1353,9 @@ function checkGameOver(){
   activos.forEach(j=>{ j.terminado=true; j.posicion=finishOrder.length+1; finishOrder.push(j); });
   gameOver=true;
   jugadores.forEach(j=>{ rolesAnteriores[j.id]=j.posicion; });
-  renderAll(); setTimeout(showResults,800); return true;
+  renderAll();
+  if(NET.online && NET.isHost) NET.broadcast(); // broadcast final state with roles
+  setTimeout(showResults,800); return true;
 }
 
 function showResults(){
@@ -1704,16 +1725,14 @@ NET.applyState = function(state, myIdx){
   if(state.statusMsg) setStatus(state.statusMsg);
   if(state.aboveMsg)  showAboveMsg(state.aboveMsg);
 
-  // Override status message from host with guest-appropriate message
+  // Override status: guest always sees "Tu turno" or "Turno de X" — never host internal messages
   if(!state.gameOver){
     if(state.turnoIdx === myIdx){
       setStatus('Tu turno');
     } else {
-      const turnPlayer = jugadores[state.turnoIdx];
-      setStatus(turnPlayer ? `Turno de ${turnPlayer.nombre}` : '');
+      const tp=jugadores[state.turnoIdx];
+      setStatus(tp ? `Turno de ${tp.nombre}` : '');
     }
-  } else {
-    if(state.statusMsg) setStatus(state.statusMsg);
   }
 
   // Exchange: show modal only if it's this guest's turn to give
