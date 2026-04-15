@@ -1150,7 +1150,7 @@ function playSelected(){
           return;
         }
       }
-      NET.pendingIdx=[...selected];
+      NET.pendingJokerIdx=[...selected];
       openJokerForNet(cartas); return;
     }
     NET.sendAction({type:'PLAY',indices:[...selected]});
