@@ -844,14 +844,19 @@ function processExchangeQueue(){
   const ex=exchangeQueue.shift();
   exchangePending={...ex, selected:[]};
 
-  const giverIsHuman = ex.giver.esHumano || (NET.online && NET.isHost && NET.isGuestSlot(ex.giver.id));
-
-  if(giverIsHuman){
-    openExchangeModal(ex.giver,ex.receiver,ex.count);
-    // For online: broadcast so the guest sees the exchange modal
-    if(NET.online && NET.isHost) NET.broadcast();
+  if(NET.online && NET.isHost){
+    if(ex.giver.id === 0){
+      // Host's own player needs to choose — show modal
+      openExchangeModal(ex.giver, ex.receiver, ex.count);
+    }
+    // Always broadcast so the correct guest sees their exchange modal
+    NET.broadcast();
+    // If giver is not host and not a guest (impossible), auto-give
+  } else if(!NET.online && ex.giver.esHumano){
+    // Single player mode: show modal for human
+    openExchangeModal(ex.giver, ex.receiver, ex.count);
   } else {
-    // Bot logic: give worst cards
+    // Bot: auto-give worst cards
     const toGive=ex.giver.worstCards(ex.count);
     toGive.forEach(c=>{ ex.giver.mano.splice(ex.giver.mano.indexOf(c),1); ex.receiver.mano.push(c); });
     ex.giver.sortHand(); ex.receiver.sortHand();
@@ -1240,6 +1245,8 @@ function doPlay(jugador,cartas){
   }
 
   renderAll();
+  // Broadcast the play immediately so all guests see the card on the table
+  if(NET.online && NET.isHost) NET.broadcast();
   if(checkGameOver()) return;
 
   // B: if player finished with ace (or joker-as-ace), start new round from next active
@@ -1275,6 +1282,7 @@ function advanceTurn(){
   if(mesaCartas.length>0&&sinPasar.length===0){
     const ganador=jugadores[ultimoEnJugar];
     showAboveMsg(`${ganador.nombre} gana la ronda`);
+    if(NET.online && NET.isHost) NET.broadcast();
     setTimeout(()=>startNewRound(ganador.id),1000);
     return;
   }
@@ -1282,6 +1290,7 @@ function advanceTurn(){
   if(mesaCartas.length>0&&sinPasar.length===1&&sinPasar[0].id===ultimoEnJugar){
     const ganador=sinPasar[0];
     showAboveMsg(`${ganador.nombre} gana la ronda`);
+    if(NET.online && NET.isHost) NET.broadcast();
     setTimeout(()=>startNewRound(ganador.id),1000);
     return;
   }
@@ -1291,20 +1300,21 @@ function advanceTurn(){
     turnoIdx=nextActive(turnoIdx);
   }
 
-  // ONLINE HOST: if it's a guest's turn, broadcast and wait
+  // Always re-render
+  renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
+
   if(NET.online && NET.isHost && NET.isGuestSlot(turnoIdx)){
     setStatus(`Turno de ${jugadores[turnoIdx].nombre}`);
-    renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
     NET.broadcast();
     return;
   }
 
-  // A: only re-render bots/player/below — NOT the table
-  renderBots(); renderPlayerHand(); renderBelowTable(); updateControls();
   if(jugadores[turnoIdx].esHumano){
     setStatus('Tu turno'); updateControls();
+    if(NET.online && NET.isHost) NET.broadcast();
   } else {
     setStatus(`Turno de ${jugadores[turnoIdx].nombre}`);
+    if(NET.online && NET.isHost) NET.broadcast();
     setTimeout(doBotTurn, botSpeed);
   }
 }
@@ -1360,8 +1370,10 @@ function checkGameOver(){
 
 function showResults(){
   const orden=[...finishOrder].sort((a,b)=>a.posicion-b.posicion);
-  document.getElementById('res-title').textContent=orden[0].esHumano?'¡Presidente!':'Fin de partida';
-  document.getElementById('res-sub').textContent=orden[0].esHumano?'¡Ganaste!':`${orden[0].nombre} es el Presidente`;
+  const myIdx = NET.online && !NET.isHost ? NET.myIdx : 0;
+  const iWon = orden[0] && orden[0].id === myIdx;
+  document.getElementById('res-title').textContent = iWon ? '¡Presidente!' : 'Fin de partida';
+  document.getElementById('res-sub').textContent   = iWon ? '¡Ganaste!' : `${orden[0]?.nombre} es el Presidente`;
   const list=document.getElementById('results-list'); list.innerHTML='';
   orden.forEach(j=>{ const row=document.createElement('div'); row.className='result-row'; row.innerHTML=`<span>${j.nombre}</span><span class="result-badge ${badgeClass(j.posicion)}">${posLabel(j.posicion)}</span>`; list.appendChild(row); });
   document.getElementById('modal-results').classList.add('show');
@@ -1756,37 +1768,54 @@ NET.applyState = function(state, myIdx){
   updateDebug();
 
   // Game over
-  if(state.gameOver && !finishOrder.length){
-    finishOrder = (state.finishOrder || []).map(id => jugadores[id]).filter(Boolean);
-    finishOrder.forEach((j,i) => { j.posicion = i + 1; });
-    setTimeout(showResults, 800);
+  if(state.gameOver){
+    if(!finishOrder.length){
+      finishOrder = (state.finishOrder || []).map(id => jugadores[id]).filter(Boolean);
+      finishOrder.forEach((j,i) => { j.posicion = i+1; });
+      setTimeout(showResults, 800);
+    }
+  } else {
+    // New game started — reset guest-side state
+    if(finishOrder.length) finishOrder = [];
   }
 };
 
 NET.handleGuestAction = function(guestIdx, action){
-  if(turnoIdx !== guestIdx) return; // not their turn, ignore
   const j = jugadores[guestIdx];
+  if(!j) return;
   const conn = Object.values(this.guests).find(g => g.idx === guestIdx)?.conn;
+  const sendErr = (msg) => { if(conn && conn.open) conn.send({type:'TOAST', msg}); };
 
-  const sendErr = (msg) => {
-    if(conn && conn.open) conn.send({type:'TOAST', msg});
-  };
+  // EXCHANGE: turnoIdx is irrelevant — check exchangePending.giver
+  if(action.type === 'EXCHANGE'){
+    if(exchangePending && exchangePending.giver.id === guestIdx){
+      const { giver, receiver } = exchangePending;
+      const toGive = action.indices.map(i => giver.mano[i]);
+      action.indices.slice().sort((a,b) => b-a).forEach(i => giver.mano.splice(i,1));
+      toGive.forEach(c => receiver.mano.push(c));
+      giver.sortHand(); receiver.sortHand();
+      exchangePending = null;
+      document.getElementById('modal-exchange').classList.remove('show');
+      setTimeout(processExchangeQueue, 400);
+    }
+    return;
+  }
+
+  // PLAY / PASS: must be this guest's turn
+  if(turnoIdx !== guestIdx){ sendErr('No es tu turno'); return; }
 
   if(action.type === 'PLAY'){
     const cartas = action.indices.map(i => j.mano[i]);
     if(cartas.some(c => !c)){ sendErr('Error: carta no encontrada'); return; }
-    if(action.jokerVal) cartas.filter(c => c.esComodin).forEach(c => { c.jokerVal = action.jokerVal; });
-    // Validate: check quantity matches mesaCantidad
+    if(action.jokerVal) cartas.filter(c=>c.esComodin).forEach(c=>{ c.jokerVal=action.jokerVal; });
     if(mesaCartas.length > 0 && cartas.length !== mesaCantidad){
       sendErr(`Debés jugar exactamente ${mesaCantidad} carta${mesaCantidad>1?'s':''}`); return;
     }
-    // Validate: check it beats the table
     if(mesaCartas.length > 0){
       const ref = mesaCartas[0];
-      const beats = cartas.some(c=>c.isAce()||(c.esComodin&&c.jokerVal==='A'))||cartas[0].beats(ref);
+      const beats = cartas.some(c=>c.isAce()||(c.esComodin&&c.jokerVal==='A')) || cartas[0].beats(ref);
       if(!beats){ sendErr('Esa jugada no supera la de la mesa'); return; }
     }
-    // First play: must include 2♦
     if(primeraRonda && mesaCartas.length === 0){
       if(!cartas.some(c=>c.value==='2'&&c.suit==='♦')){ sendErr('Debés jugar el 2♦ para arrancar'); return; }
     }
@@ -1795,22 +1824,10 @@ NET.handleGuestAction = function(guestIdx, action){
 
   if(action.type === 'PASS'){
     j.pasado = true; selected = [];
-    turnoIdx = nextActive(j.id);
     setStatus(`${j.nombre} pasó`);
+    turnoIdx = nextActive(j.id);
+    if(NET.online && NET.isHost) NET.broadcast();
     advanceTurn();
-  }
-
-  if(action.type === 'EXCHANGE'){
-    if(exchangePending && exchangePending.giver.id === guestIdx){
-      const { giver, receiver } = exchangePending;
-      const toGive = action.indices.map(i => giver.mano[i]);
-      action.indices.slice().sort((a,b) => b - a).forEach(i => giver.mano.splice(i, 1));
-      toGive.forEach(c => receiver.mano.push(c));
-      giver.sortHand(); receiver.sortHand();
-      exchangePending = null;
-      document.getElementById('modal-exchange').classList.remove('show');
-      setTimeout(processExchangeQueue, 400);
-    }
   }
 };
 
